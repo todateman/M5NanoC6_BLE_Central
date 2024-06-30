@@ -13,6 +13,8 @@
 // Set up a new SoftwareSerial object
 SoftwareSerial SoftSerial;
 
+#define BLUE_LED_PIN 7  // 青色LED端子番号
+
 // ServerのBLE サービスとキャラクタリスティックのUUIDを定義 https://www.uuidgenerator.net/version4
 #define SERVICE_UUID "7c445963-c1a4-4635-a119-b490ed272552"
 #define CHARACTERISTIC_UUID "ced47adc-db99-46a2-9248-cb70b7bd836f"
@@ -67,6 +69,7 @@ static void notifyCallback(
     size_t length,
     bool isNotify)
 {
+  digitalWrite(BLUE_LED_PIN, HIGH); // 本体LED点灯
   Serial.print("Notify callback for characteristic ");
   Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
   Serial.print(" of data length ");
@@ -160,12 +163,15 @@ void setup()
 {
   Serial.begin(115200);
 
-    // Define pin modes for TX and RX
-    pinMode(rxPin, INPUT);
-    pinMode(txPin, OUTPUT);
+  // Define pin modes for TX and RX
+  pinMode(rxPin, INPUT);
+  pinMode(txPin, OUTPUT);
+  pinMode(BLUE_LED_PIN, OUTPUT); // 本体LED青
+
+  digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
     
-    // Set the baud rate for the SoftwareSerial object
-    SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);
+  // Set the baud rate for the SoftwareSerial object
+  SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);
 
   BLEDevice::init("M5NanoC6 BLE Client");
 
@@ -175,6 +181,7 @@ void setup()
 
 void loop()
 {
+  digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
   switch (state)
   {
   case STATE_DO_CONNECT:
