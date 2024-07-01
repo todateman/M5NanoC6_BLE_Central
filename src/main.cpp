@@ -16,9 +16,9 @@ SoftwareSerial SoftSerial;
 #define BLUE_LED_PIN 7  // 青色LED端子番号
 
 // ServerのBLE サービスとキャラクタリスティックのUUIDを定義 https://www.uuidgenerator.net/version4
-#define SERVICE_UUID "7c445963-c1a4-4635-a119-b490ed272552"
-#define CHARACTERISTIC_UUID "ced47adc-db99-46a2-9248-cb70b7bd836f"
-#define NOTIFY_CHARACTERISTIC_UUID "dca30b2b-658e-484a-a7fc-974c08800429"
+#define SERVICE_UUID "7c44181A-c1a4-4635-a119-b490ed272552"
+#define CHARACTERISTIC_UUID "7c442A00-c1a4-4635-a119-b490ed272552"
+#define NOTIFY_CHARACTERISTIC_UUID "7c442A6E-c1a4-4635-a119-b490ed272552"
 
 static BLEUUID serviceUUID(SERVICE_UUID);
 static BLEUUID charUUID(CHARACTERISTIC_UUID);
