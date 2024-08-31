@@ -6,12 +6,8 @@
 #include <Arduino.h>
 #include <BLEDevice.h>
 
-// I2C -> SoftwareSerial
-#include "SoftwareSerial.h"
-#define rxPin 1   // SCL
-#define txPin 2   // SCA
-// Set up a new SoftwareSerial object
-SoftwareSerial SoftSerial;
+#include <Wire.h>
+#define I2Caddress 0x67 //1100111b, I2C 7bitアドレス
 
 #define BLUE_LED_PIN 7  // 青色LED端子番号
 
@@ -77,9 +73,12 @@ static void notifyCallback(
   Serial.print("data: ");
   Serial.write((char *)pData, length);
   Serial.println();
-  // Output GrovePort
-  SoftSerial.write((char *)pData, length);
-  SoftSerial.println();
+
+  Wire.beginTransmission(I2Caddress);   // スレーブのI2Cアドレスに接続
+  for (size_t i = 0; i < length; i++) {
+    Wire.write(pData[i]);               // 受信したデータをI2Cで送信
+  }
+  Wire.endTransmission();               // 送信終了
 }
 
 void scan()
@@ -163,15 +162,11 @@ void setup()
 {
   Serial.begin(115200);
 
-  // Define pin modes for TX and RX
-  pinMode(rxPin, INPUT);
-  pinMode(txPin, OUTPUT);
   pinMode(BLUE_LED_PIN, OUTPUT); // 本体LED青
 
   digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
     
-  // Set the baud rate for the SoftwareSerial object
-  SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);
+  Wire.begin(2, 1);                 // I2C通信初期化(SDA, SCL)、グローブコネクタの端子番号を指定
 
   BLEDevice::init("M5NanoC6 BLE Client");
 
