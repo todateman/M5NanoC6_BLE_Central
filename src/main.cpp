@@ -75,9 +75,7 @@ static void notifyCallback(
   Serial.println();
 
   Wire.beginTransmission(I2Caddress);   // スレーブのI2Cアドレスに接続
-  for (size_t i = 0; i < length; i++) {
-    Wire.write(pData[i]);               // 受信したデータをI2Cで送信
-  }
+  Wire.write(pData, length);            // 受信したデータをI2Cで送信
   Wire.endTransmission();               // 送信終了
 }
 
