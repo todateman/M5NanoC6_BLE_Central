@@ -9,7 +9,7 @@
 // I2C -> SoftwareSerial
 #include "SoftwareSerial.h"
 #define rxPin 1   // SCL
-#define txPin 2   // SCA
+#define txPin 2   // SDA
 // Set up a new SoftwareSerial object
 SoftwareSerial SoftSerial;
 
