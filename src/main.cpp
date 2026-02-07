@@ -77,9 +77,26 @@ static void notifyCallback(
   Serial.print("data: ");
   Serial.write((char *)pData, length);
   Serial.println();
-  // Output GrovePort
-  SoftSerial.write((char *)pData, length);
-  SoftSerial.println();
+  
+  // Output GrovePort - 改善版
+  // 1. バッファに書き込む
+  size_t written = SoftSerial.write((char *)pData, length);
+  
+  // 2. 送信完了を待機
+  SoftSerial.flush();
+  
+  // 3. 送信結果をログ出力
+  Serial.print("UART sent: ");
+  Serial.print(written);
+  Serial.print("/");
+  Serial.println(length);
+  
+  if (written != length) {
+    Serial.println("WARNING: Not all data was sent!");
+  }
+  
+  // 4. 受信側の処理を待つため少し遅延
+  delay(10);
 }
 
 void scan()
@@ -171,7 +188,8 @@ void setup()
   digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
     
   // Set the baud rate for the SoftwareSerial object
-  SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);
+  // バッファサイズを256から512に増加（より大きなデータ送信対応）
+  SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 512);
 
   BLEDevice::init("M5NanoC6 BLE Client");
 

@@ -92,20 +92,58 @@ Connected to server
 Notify callback for characteristic ... of data length N
 ```
 
+## UART送信の改善（2025-02-07版）
+
+データ受信の途切れ問題に対応して以下を実装しました：
+
+### 改善内容
+
+| 項目 | 内容 | 効果 |
+|------|------|------|
+| **バッファサイズ拡大** | 256バイト → 512バイト | 大きなデータパケットに対応 |
+| **送信完了待機（flush）** | `SoftSerial.flush()` 追加 | データロスを確実に防止 |
+| **送信確認ログ** | 実際に送信されたバイト数を記録 | 問題デバッグが容易 |
+| **受信側処理待ち遅延** | 10ms のディレイを追加 | 高速送信によるオーバーフロー防止 |
+| **余分なデータ削除** | `SoftSerial.println()` を削除 | 不要な改行を送信しない |
+
+### notifyCallback関数の実装例
+
+```cpp
+static void notifyCallback(...)
+{
+  // ...existing code...
+  
+  // Output GrovePort - 改善版
+  size_t written = SoftSerial.write((char *)pData, length);
+  SoftSerial.flush();  // 送信完了を待機
+  
+  Serial.print("UART sent: ");
+  Serial.print(written);
+  Serial.print("/");
+  Serial.println(length);  // 送信結果をログ出力
+  
+  if (written != length) {
+    Serial.println("WARNING: Not all data was sent!");
+  }
+  
+  delay(10);  // 受信側処理を待つ
+}
+```
+
 ## カスタマイズポイント
 
 - スキャン時間: `scan()` 内 `pBLEScan->start(5, false);`
-- UART/SoftwareSerial: `SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin, false, 256)` で速度/フォーマット/バッファ変更可
+- UART/SoftwareSerial: `SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin, false, 512)` で速度/フォーマット/バッファ変更可
+  - **バッファサイズ は最低512バイト以上推奨** (データロス防止)
+  - さらなる安定性が必要な場合: `delay(length / 100 + 10);` で動的遅延を検討
 - ピン: `rxPin=1`, `txPin=2` (Grove ポート)
 - LED ピン: `#define BLUE_LED_PIN 7`
 - UUID: `#define SERVICE_UUID ...` 等で差し替え可能
 - 再接続ポリシー: 現状は切断後 IDLE のみ。`onDisconnect` 内で `scan()` を再呼出すか状態追加予定
-- 改行付加: コードは `SoftSerial.write(data); SoftSerial.println();` で後続パースを容易化
 
 ## 今後の改善案
 
 - 接続失敗/切断後の自動再スキャンループ（指数バックオフ or 一定間隔）
-- 再接続時の SoftwareSerial バッファクリア/同期
 - float16 → float32 変換/スケーリングユーティリティ
 - 省電力 (スキャン間隔調整 / Wi-Fi 無効化)
 - Write キャラクタリスティック活用 (将来の制御コマンド)
@@ -118,4 +156,4 @@ Notify callback for characteristic ... of data length N
 本ソフトウェアは MIT License です。`LICENSE` を参照してください。
 
 ---
-ドキュメント最終更新: 2025-11-08
+ドキュメント最終更新: 2025-02-07
