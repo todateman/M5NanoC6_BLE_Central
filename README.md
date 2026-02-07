@@ -1,7 +1,8 @@
 ﻿# M5NanoC6 BLE Central
 
-[M5NanoC6](https://docs.m5stack.com/ja/core/M5NanoC6)（ESP32-C6) を使用した BLE Central (クライアント) 実装サンプルです。
-M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために M5NanoC6 を外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを Grove ポートの SoftwareSerial(UART) 経由で ESP32 側マイコンへ転送します（115200bps, 8N1, rxPin=1, txPin=2）。
+[M5NanoC6](https://docs.m5stack.com/ja/core/M5NanoC6)（ESP32-C6) を使用した BLE Central (クライアント) 実装サンプルです。  
+M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために M5NanoC6 を外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを Grove ポートの SoftwareSerial(UART) 経由で https://github.com/todateman/Chibi-T_Furoshiki_Logger へ転送します  
+（115200bps, 8N1, rxPin=1, txPin=2）。
 
 ## 特徴
 
@@ -22,6 +23,7 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
 - 動作環境: 屋内 / 屋根のある屋外
 
 ## BLE UUID 一覧
+
 | 用途 | UUID |
 |------|------|
 | Service | `7c44181A-c1a4-4635-a119-b490ed272552` |
@@ -112,6 +114,7 @@ Notify callback for characteristic ... of data length N
 - 状態遷移図とエラーハンドリング整備
 
 ## ライセンス
+
 本ソフトウェアは MIT License です。`LICENSE` を参照してください。
 
 ---
