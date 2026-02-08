@@ -6,12 +6,11 @@
 #include <Arduino.h>
 #include <BLEDevice.h>
 
-// I2C -> SoftwareSerial
-#include "SoftwareSerial.h"
+// Grove Port -> Hardware UART1
 #define rxPin 1   // SCL
 #define txPin 2   // SDA
-// Set up a new SoftwareSerial object
-SoftwareSerial SoftSerial;
+// Set up Hardware UART1 object
+HardwareSerial SerialUART(1);
 
 #define BLUE_LED_PIN 7  // 青色LED端子番号
 
@@ -78,25 +77,14 @@ static void notifyCallback(
   Serial.write((char *)pData, length);
   Serial.println();
   
-  // Output GrovePort - 改善版
-  // 1. バッファに書き込む
-  size_t written = SoftSerial.write((char *)pData, length);
+  // Output GrovePort - Hardware UART版
+  // ハードウェアUARTは自動バッファ管理で安定送信
+  size_t written = SerialUART.write((char *)pData, length);
   
-  // 2. 送信完了を待機
-  SoftSerial.flush();
-  
-  // 3. 送信結果をログ出力
   Serial.print("UART sent: ");
   Serial.print(written);
   Serial.print("/");
   Serial.println(length);
-  
-  if (written != length) {
-    Serial.println("WARNING: Not all data was sent!");
-  }
-  
-  // 4. 受信側の処理を待つため少し遅延
-  delay(10);
 }
 
 void scan()
@@ -187,9 +175,9 @@ void setup()
 
   digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
     
-  // Set the baud rate for the SoftwareSerial object
-  // バッファサイズを256から512に増加（より大きなデータ送信対応）
-  SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 512);
+  // Set the baud rate for the Hardware UART1 object
+  // ハードウェアUARTは自動バッファ管理（より安定した通信）
+  SerialUART.begin(115200, SERIAL_8N1, rxPin, txPin);
 
   BLEDevice::init("M5NanoC6 BLE Client");
 

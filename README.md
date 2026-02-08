@@ -1,15 +1,15 @@
 ﻿# M5NanoC6 BLE Central
 
 [M5NanoC6](https://docs.m5stack.com/ja/core/M5NanoC6)（ESP32-C6) を使用した BLE Central (クライアント) 実装サンプルです。  
-M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために M5NanoC6 を外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを Grove ポートの SoftwareSerial(UART) 経由で https://github.com/todateman/Chibi-T_Furoshiki_Logger へ転送します  
-（115200bps, 8N1, rxPin=1, txPin=2）。
+M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために M5NanoC6 を外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを Grove ポートの HardwareSerial(UART1) 経由で [Chibi-T_Furoshiki_Logger](https://github.com/todateman/Chibi-T_Furoshiki_Logger) へ転送します。  
+（115200bps, 8N1, rxPin=1, txPin=2）
 
 ## 特徴
 
 - Arduino フレームワーク (esp32-arduino)
 - BLE Central: 指定サービス UUID をスキャン → 接続 → Notify 購読
-- Notify 受信で LED(青) 点灯し、受信バイト列をそのまま SoftwareSerial(UART) 出力
-- Grove ポートを UART ブリッジ化 (SoftwareSerial 115200bps / 8N1 / バッファ 256)
+- Notify 受信で LED(青) 点灯し、受信バイト列をそのまま Hardware UART1 出力
+- Grove ポートを UART ブリッジ化 (Hardware UART1 115200bps / 8N1 / 自動バッファ管理)
 - PlatformIO プロジェクト構成 (複数 env 拡張可能)
 - Arduino フレームワーク (esp32-arduino)
 - USB CDC 有効化設定済み (高速アップロード 1.5Mbps 設定)
@@ -25,7 +25,7 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
 ## BLE UUID 一覧
 
 | 用途 | UUID |
-|------|------|
+| ---- | ---- |
 | Service | `7c44181A-c1a4-4635-a119-b490ed272552` |
 | Write Characteristic | `7c442A00-c1a4-4635-a119-b490ed272552` |
 | Notify Characteristic | `7c442A6E-c1a4-4635-a119-b490ed272552` |
@@ -92,50 +92,12 @@ Connected to server
 Notify callback for characteristic ... of data length N
 ```
 
-## UART送信の改善（2025-02-07版）
-
-データ受信の途切れ問題に対応して以下を実装しました：
-
-### 改善内容
-
-| 項目 | 内容 | 効果 |
-|------|------|------|
-| **バッファサイズ拡大** | 256バイト → 512バイト | 大きなデータパケットに対応 |
-| **送信完了待機（flush）** | `SoftSerial.flush()` 追加 | データロスを確実に防止 |
-| **送信確認ログ** | 実際に送信されたバイト数を記録 | 問題デバッグが容易 |
-| **受信側処理待ち遅延** | 10ms のディレイを追加 | 高速送信によるオーバーフロー防止 |
-| **余分なデータ削除** | `SoftSerial.println()` を削除 | 不要な改行を送信しない |
-
-### notifyCallback関数の実装例
-
-```cpp
-static void notifyCallback(...)
-{
-  // ...existing code...
-  
-  // Output GrovePort - 改善版
-  size_t written = SoftSerial.write((char *)pData, length);
-  SoftSerial.flush();  // 送信完了を待機
-  
-  Serial.print("UART sent: ");
-  Serial.print(written);
-  Serial.print("/");
-  Serial.println(length);  // 送信結果をログ出力
-  
-  if (written != length) {
-    Serial.println("WARNING: Not all data was sent!");
-  }
-  
-  delay(10);  // 受信側処理を待つ
-}
-```
-
 ## カスタマイズポイント
 
 - スキャン時間: `scan()` 内 `pBLEScan->start(5, false);`
-- UART/SoftwareSerial: `SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin, false, 512)` で速度/フォーマット/バッファ変更可
-  - **バッファサイズ は最低512バイト以上推奨** (データロス防止)
-  - さらなる安定性が必要な場合: `delay(length / 100 + 10);` で動的遅延を検討
+- UART/Hardware UART1: `SerialUART.begin(115200, SERIAL_8N1, rxPin, txPin)` で速度/フォーマット変更可
+  - **ハードウェアUARTは自動バッファ管理**（flush/delayは不要）
+  - より高速な通信（最大921600bps）にも対応可能
 - ピン: `rxPin=1`, `txPin=2` (Grove ポート)
 - LED ピン: `#define BLUE_LED_PIN 7`
 - UUID: `#define SERVICE_UUID ...` 等で差し替え可能
@@ -156,4 +118,4 @@ static void notifyCallback(...)
 本ソフトウェアは MIT License です。`LICENSE` を参照してください。
 
 ---
-ドキュメント最終更新: 2025-02-07
+ドキュメント最終更新: 2025-02-08 (ハードウェアUART化)
