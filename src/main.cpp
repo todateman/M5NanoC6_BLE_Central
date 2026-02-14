@@ -30,6 +30,10 @@ static int8_t state = 0;
 static unsigned long ledOnTime = 0;  // LED点灯開始時刻
 static const unsigned long LED_ON_DURATION = 500;  // LED点灯時間（ミリ秒）
 
+// BLE受信データバッファ（改行までのデータを保持）
+static String rxBuffer = "";
+static const size_t RX_BUFFER_MAX = 256;  // 最大バッファサイズ
+
 #define STATE_IDLE 0
 #define STATE_DO_CONNECT 1
 #define STATE_CONNECTED 3
@@ -76,18 +80,50 @@ static void notifyCallback(
   Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
   Serial.print(" of data length ");
   Serial.println(length);
-  Serial.print("data: ");
-  Serial.write((char *)pData, length);
-  Serial.println();
   
-  // Output GrovePort - Hardware UART版
-  // ハードウェアUARTは自動バッファ管理で安定送信
-  size_t written = SerialUART.write((char *)pData, length);
+  // 受信データをバッファに追加
+  for (size_t i = 0; i < length; i++)
+  {
+    char c = (char)pData[i];
+    
+    if (c == '\n')
+    {
+      // 改行を受信 → メッセージ完成
+      Serial.print("Complete message: ");
+      Serial.println(rxBuffer.c_str());
+      
+      // 完全なメッセージをUART送信（改行を含む）
+      SerialUART.write(rxBuffer.c_str(), rxBuffer.length());
+      SerialUART.write('\n');  // 改行を送信
+      
+      Serial.print("UART sent: ");
+      Serial.print(rxBuffer.length() + 1);
+      Serial.println(" bytes (including newline)");
+      
+      // バッファクリア
+      rxBuffer = "";
+    }
+    else if (c != '\r')
+    {
+      // キャリッジリターンは無視、その他の文字をバッファに追加
+      if (rxBuffer.length() < RX_BUFFER_MAX)
+      {
+        rxBuffer += c;
+      }
+      else
+      {
+        // バッファオーバーフロー対策
+        Serial.println("ERROR: RX buffer overflow!");
+        rxBuffer = "";
+      }
+    }
+  }
   
-  Serial.print("UART sent: ");
-  Serial.print(written);
-  Serial.print("/");
-  Serial.println(length);
+  if (rxBuffer.length() > 0)
+  {
+    Serial.print("Buffered data: ");
+    Serial.println(rxBuffer.c_str());
+  }
 }
 
 void scan()
