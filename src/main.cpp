@@ -27,6 +27,8 @@ static BLERemoteCharacteristic *pRemoteCharacteristic;
 static BLERemoteCharacteristic *pNotifyCharacteristic;
 
 static int8_t state = 0;
+static unsigned long ledOnTime = 0;  // LED点灯開始時刻
+static const unsigned long LED_ON_DURATION = 500;  // LED点灯時間（ミリ秒）
 
 #define STATE_IDLE 0
 #define STATE_DO_CONNECT 1
@@ -69,6 +71,7 @@ static void notifyCallback(
     bool isNotify)
 {
   digitalWrite(BLUE_LED_PIN, HIGH); // 本体LED点灯
+  ledOnTime = millis();  // LED点灯開始時刻を記録
   Serial.print("Notify callback for characteristic ");
   Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
   Serial.print(" of data length ");
@@ -187,7 +190,13 @@ void setup()
 
 void loop()
 {
-  digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
+  // LED点灯時間後に自動消灯
+  if (ledOnTime > 0 && (millis() - ledOnTime) >= LED_ON_DURATION)
+  {
+    digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
+    ledOnTime = 0;
+  }
+
   switch (state)
   {
   case STATE_DO_CONNECT:
