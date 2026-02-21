@@ -6,12 +6,11 @@
 #include <Arduino.h>
 #include <BLEDevice.h>
 
-// I2C -> SoftwareSerial
-#include "SoftwareSerial.h"
+// Grove Port -> Hardware UART1
 #define rxPin 1   // SCL
 #define txPin 2   // SDA
-// Set up a new SoftwareSerial object
-SoftwareSerial SoftSerial;
+// Set up Hardware UART1 object
+HardwareSerial SerialUART(1);
 
 #define BLUE_LED_PIN 7  // 青色LED端子番号
 
@@ -28,6 +27,12 @@ static BLERemoteCharacteristic *pRemoteCharacteristic;
 static BLERemoteCharacteristic *pNotifyCharacteristic;
 
 static int8_t state = 0;
+static unsigned long ledOnTime = 0;  // LED点灯開始時刻
+static const unsigned long LED_ON_DURATION = 500;  // LED点灯時間（ミリ秒）
+
+// BLE受信データバッファ（改行までのデータを保持）
+static String rxBuffer = "";
+static const size_t RX_BUFFER_MAX = 256;  // 最大バッファサイズ
 
 #define STATE_IDLE 0
 #define STATE_DO_CONNECT 1
@@ -70,16 +75,55 @@ static void notifyCallback(
     bool isNotify)
 {
   digitalWrite(BLUE_LED_PIN, HIGH); // 本体LED点灯
+  ledOnTime = millis();  // LED点灯開始時刻を記録
   Serial.print("Notify callback for characteristic ");
   Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
   Serial.print(" of data length ");
   Serial.println(length);
-  Serial.print("data: ");
-  Serial.write((char *)pData, length);
-  Serial.println();
-  // Output GrovePort
-  SoftSerial.write((char *)pData, length);
-  SoftSerial.println();
+  
+  // 受信データをバッファに追加
+  for (size_t i = 0; i < length; i++)
+  {
+    char c = (char)pData[i];
+    
+    if (c == '\n')
+    {
+      // 改行を受信 → メッセージ完成
+      Serial.print("Complete message: ");
+      Serial.println(rxBuffer.c_str());
+      
+      // 完全なメッセージをUART送信（改行を含む）
+      SerialUART.write(rxBuffer.c_str(), rxBuffer.length());
+      SerialUART.write('\n');  // 改行を送信
+      
+      Serial.print("UART sent: ");
+      Serial.print(rxBuffer.length() + 1);
+      Serial.println(" bytes (including newline)");
+      
+      // バッファクリア
+      rxBuffer = "";
+    }
+    else if (c != '\r')
+    {
+      // キャリッジリターンは無視、その他の文字をバッファに追加
+      if (rxBuffer.length() < RX_BUFFER_MAX)
+      {
+        rxBuffer += c;
+      }
+      else
+      {
+        // バッファオーバーフロー対策
+        Serial.println("ERROR: RX buffer overflow!");
+        rxBuffer = "";
+      }
+    }
+  }
+  
+  if (rxBuffer.length() > 0)
+  {
+    Serial.print("Buffered data: ");
+    Serial.println(rxBuffer.c_str());
+  }
 }
 
 void scan()
@@ -170,8 +214,9 @@ void setup()
 
   digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
     
-  // Set the baud rate for the SoftwareSerial object
-  SoftSerial.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);
+  // Set the baud rate for the Hardware UART1 object
+  // ハードウェアUARTは自動バッファ管理（より安定した通信）
+  SerialUART.begin(115200, SERIAL_8N1, rxPin, txPin);
 
   BLEDevice::init("M5NanoC6 BLE Client");
 
@@ -181,7 +226,13 @@ void setup()
 
 void loop()
 {
-  digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
+  // LED点灯時間後に自動消灯
+  if (ledOnTime > 0 && (millis() - ledOnTime) >= LED_ON_DURATION)
+  {
+    digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
+    ledOnTime = 0;
+  }
+
   switch (state)
   {
   case STATE_DO_CONNECT:
