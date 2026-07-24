@@ -1,15 +1,15 @@
 ﻿# M5NanoC6 BLE Central
 
 [M5NanoC6](https://docs.m5stack.com/ja/core/M5NanoC6)（ESP32-C6) を使用した BLE Central (クライアント) 実装サンプルです。  
-M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために M5NanoC6 を外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを Grove ポートの HardwareSerial(UART1) 経由で [Chibi-T_Furoshiki_Logger](https://github.com/todateman/Chibi-T_Furoshiki_Logger) へ転送します。  
-（115200bps, 8N1, rxPin=1, txPin=2）
+M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために M5NanoC6 を外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを Grove ポート経由の I2C スレーブとして保持し、M5Stack Basic（I2C マスター）からの読み出し要求に応じて返します。  
+（I2Cスレーブアドレス: 0x08, SDA=GPIO2, SCL=GPIO1）
 
 ## 特徴
 
 - Arduino フレームワーク (esp32-arduino)
 - BLE Central: 指定サービス UUID をスキャン → 接続 → Notify 購読
-- Notify 受信で LED(青) 点灯し、受信バイト列をそのまま Hardware UART1 出力
-- Grove ポートを UART ブリッジ化 (Hardware UART1 115200bps / 8N1 / 自動バッファ管理)
+- Notify 受信で LED(青) 点灯し、受信データを32バイト固定フレームに格納して保持
+- Grove ポートを I2C スレーブ化 (アドレス 0x08、コマンドで要求データの種類を指定して応答)
 - PlatformIO プロジェクト構成 (複数 env 拡張可能)
 - Arduino フレームワーク (esp32-arduino)
 - USB CDC 有効化設定済み (高速アップロード 1.5Mbps 設定)
@@ -17,7 +17,7 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
 ## ハードウェア要件
 
 - M5Stack NanoC6 (ESP32-C6) ボード
-- Grove ポート接続先: ESP32 搭載 M5Stack 系マイコン (UART 受信側。115200bps 想定)
+- Grove ポート接続先: M5Stack Basic（I2C マスター、Port A: G21=SDA, G22=SCL 想定）
 - 接続先 BLE ペリフェラル (後述 UUID 実装)
 - 電源: USB 5V または Grove 5V 給電
 - 動作環境: 屋内 / 屋根のある屋外
@@ -41,7 +41,7 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
    - Notify キャラクタリスティック購読登録
 4. Notify 受信:
    - 青色 LED 点灯 (次ループで消灯)
-   - データ (最大 float16 長: 2 バイト / もしくは int 値) を SoftwareSerial (UART) で下流 ESP32 へ送信（改行付加）
+   - 改行までのデータを I2C 送信用フレーム (`i2cTxFrame`) に格納・保持し、M5Stack Basic からの要求を待機
 5. 切断イベント発生時:
    - `onDisconnect` で state を IDLE に戻すのみ  
      (現状: 自動再スキャン未実装 / 改善予定)
@@ -49,18 +49,74 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
 ### シンプルなデータフロー（論理）
 
 ```text
-BLE Peripheral  --(Notify: 数値 float16/int)-->  M5NanoC6 (Central)  --(UART 115200 8N1)-->  ESP32 (既存M5Stack)
+BLE Peripheral --(Notify: 文字列データ)--> M5NanoC6 (I2Cスレーブ, addr=0x08) <--(I2C要求/応答)-- M5Stack Basic (I2Cマスター)
 ```
 
 ## ソース構成
 
 ```text
-src/main.cpp        BLEスキャン/接続/Notifyハンドラ + SoftwareSerial ブリッジ
+src/main.cpp        BLEスキャン/接続/Notifyハンドラ + I2Cスレーブ応答
 platformio.ini      PlatformIO 設定
 custon_hwids.py     事前スクリプト (HWID カスタマイズ?) 要確認
 sdkconfig.*         ESP-IDF ベースの設定 (一部反映) 要確認
 include/, lib/, test/ README のみ (拡張用)
 ```
+
+## I2C通信仕様
+
+- スレーブアドレス: `0x08`
+- ピン: SDA=GPIO2, SCL=GPIO1（Grove ポート）
+- コマンド方式: マスターは読み出し前に1バイトのコマンドコードを書き込み、どのデータを要求するかを明示する（今後 M5NanoC6 で他のデータも中継する場合に備えた設計）
+  - `CMD_ENGINE_TEMP` (`0x01`): エンジン温度データを要求
+  - 未定義のコマンドを書き込んだ場合は長さ0（先頭バイトが `0x00`）の空フレームを返す
+- フレーム形式: 32バイト固定
+  - `[0]`: データ長 (0〜31)
+  - `[1..31]`: データ本体（余りはゼロ埋め）
+  - BLE Notify 未受信時（起動直後など）は全ゼロを返す
+- 動作: マスターがコマンドを書き込んだ後 `Wire.requestFrom()` で読み出すと、直近に BLE で受信した最新データを返す（新しい Notify を受信するまで同じ値を返し続ける）
+
+### M5Stack Basic（マスター）側のサンプルコード
+
+```cpp
+#include <M5Stack.h>
+#include <Wire.h>
+
+#define I2C_SLAVE_ADDR 0x08
+#define I2C_FRAME_SIZE 32
+#define CMD_ENGINE_TEMP 0x01
+
+void setup() {
+  M5.begin();
+  Wire.begin(21, 22); // Grove Port A (SDA, SCL)
+}
+
+void loop() {
+  // 1. コマンドを書き込み、要求するデータの種類を伝える
+  Wire.beginTransmission(I2C_SLAVE_ADDR);
+  Wire.write(CMD_ENGINE_TEMP);
+  Wire.endTransmission();
+
+  // 2. フレームを読み出す
+  uint8_t frame[I2C_FRAME_SIZE];
+  Wire.requestFrom(I2C_SLAVE_ADDR, I2C_FRAME_SIZE);
+  for (int i = 0; i < I2C_FRAME_SIZE && Wire.available(); i++) {
+    frame[i] = Wire.read();
+  }
+
+  uint8_t len = frame[0];
+  if (len > 0) {
+    String data;
+    for (int i = 0; i < len; i++) {
+      data += (char)frame[1 + i];
+    }
+    Serial.println(data); // 受信データ（エンジン温度）を表示
+  }
+
+  delay(500); // ポーリング間隔
+}
+```
+
+※ Port A のピン番号は使用する M5Stack シリーズ機種によって異なる場合があるため、実機に応じて `Wire.begin(sda, scl)` の引数を調整してください。
 
 ## ビルド & アップロード手順 (PlatformIO)
 
@@ -95,10 +151,10 @@ Notify callback for characteristic ... of data length N
 ## カスタマイズポイント
 
 - スキャン時間: `scan()` 内 `pBLEScan->start(5, false);`
-- UART/Hardware UART1: `SerialUART.begin(115200, SERIAL_8N1, rxPin, txPin)` で速度/フォーマット変更可
-  - **ハードウェアUARTは自動バッファ管理**（flush/delayは不要）
-  - より高速な通信（最大921600bps）にも対応可能
-- ピン: `rxPin=1`, `txPin=2` (Grove ポート)
+- I2Cスレーブアドレス: `#define I2C_SLAVE_ADDR 0x08` で変更可
+- I2Cピン: `#define I2C_SDA_PIN 2`, `#define I2C_SCL_PIN 1` (Grove ポート)
+- フレームサイズ: `#define I2C_FRAME_SIZE 32` で変更可（データ本体は `I2C_FRAME_SIZE - 1` バイトまで）
+- コマンド: `#define CMD_ENGINE_TEMP 0x01` に加え、他のデータを中継する場合は新しいコマンド定数とフレーム/ハンドリングを追加
 - LED ピン: `#define BLUE_LED_PIN 7`
 - UUID: `#define SERVICE_UUID ...` 等で差し替え可能
 - 再接続ポリシー: 現状は切断後 IDLE のみ。`onDisconnect` 内で `scan()` を再呼出すか状態追加予定
@@ -118,4 +174,4 @@ Notify callback for characteristic ... of data length N
 本ソフトウェアは MIT License です。`LICENSE` を参照してください。
 
 ---
-ドキュメント最終更新: 2025-02-08 (ハードウェアUART化)
+ドキュメント最終更新: 2026-07-25 (I2Cスレーブ化)

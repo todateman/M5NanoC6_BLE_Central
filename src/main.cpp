@@ -5,12 +5,16 @@
 
 #include <Arduino.h>
 #include <BLEDevice.h>
+#include <Wire.h>
 
-// Grove Port -> Hardware UART1
-#define rxPin 1   // SCL
-#define txPin 2   // SDA
-// Set up Hardware UART1 object
-HardwareSerial SerialUART(1);
+// Grove Port -> I2C (M5Stack Basicをマスターとするスレーブとして動作)
+#define I2C_SCL_PIN 1
+#define I2C_SDA_PIN 2
+#define I2C_SLAVE_ADDR 0x08
+#define I2C_FRAME_SIZE 32  // 1byte長さ + 最大31byteデータ
+
+// マスターが要求するデータの種類を表すコマンド（今後他のデータを中継する場合はここに追加）
+#define CMD_ENGINE_TEMP 0x01
 
 #define BLUE_LED_PIN 7  // 青色LED端子番号
 
@@ -33,6 +37,12 @@ static const unsigned long LED_ON_DURATION = 500;  // LED点灯時間（ミリ�
 // BLE受信データバッファ（改行までのデータを保持）
 static String rxBuffer = "";
 static const size_t RX_BUFFER_MAX = 256;  // 最大バッファサイズ
+
+// エンジン温度のI2C送信用フレーム（先頭1byteが長さ、以降が実データ）。M5Stack Basicからの要求時に最新値を返す
+static uint8_t engineTempFrame[I2C_FRAME_SIZE] = {0};
+
+// マスターが直前に書き込んできたコマンド（onReceiveで更新し、onRequestで参照する）
+static uint8_t lastCommand = 0x00;
 
 #define STATE_IDLE 0
 #define STATE_DO_CONNECT 1
@@ -92,13 +102,18 @@ static void notifyCallback(
       Serial.print("Complete message: ");
       Serial.println(rxBuffer.c_str());
       
-      // 完全なメッセージをUART送信（改行を含む）
-      SerialUART.write(rxBuffer.c_str(), rxBuffer.length());
-      SerialUART.write('\n');  // 改行を送信
-      
-      Serial.print("UART sent: ");
-      Serial.print(rxBuffer.length() + 1);
-      Serial.println(" bytes (including newline)");
+      // エンジン温度フレームを更新（CMD_ENGINE_TEMP要求時にこの内容を返す）
+      size_t dataLen = min(rxBuffer.length(), (size_t)(I2C_FRAME_SIZE - 1));
+      engineTempFrame[0] = (uint8_t)dataLen;
+      memcpy(&engineTempFrame[1], rxBuffer.c_str(), dataLen);
+      if (dataLen < I2C_FRAME_SIZE - 1)
+      {
+        memset(&engineTempFrame[1 + dataLen], 0, I2C_FRAME_SIZE - 1 - dataLen);
+      }
+
+      Serial.print("I2C frame updated: ");
+      Serial.print(dataLen);
+      Serial.println(" bytes");
       
       // バッファクリア
       rxBuffer = "";
@@ -123,6 +138,38 @@ static void notifyCallback(
   {
     Serial.print("Buffered data: ");
     Serial.println(rxBuffer.c_str());
+  }
+}
+
+// M5Stack Basic（I2Cマスター）からのコマンド書き込み受信時に呼ばれる
+void onI2CReceive(int numBytes)
+{
+  if (numBytes > 0)
+  {
+    lastCommand = Wire.read();
+  }
+  // 想定外の追加バイトは読み捨てる
+  while (Wire.available())
+  {
+    Wire.read();
+  }
+}
+
+// M5Stack Basic（I2Cマスター）からの読み出し要求時に呼ばれる
+void onI2CRequest()
+{
+  switch (lastCommand)
+  {
+  case CMD_ENGINE_TEMP:
+    Wire.write(engineTempFrame, I2C_FRAME_SIZE);
+    break;
+  default:
+  {
+    // 未知のコマンド: 長さ0の空フレームを返す
+    uint8_t emptyFrame[I2C_FRAME_SIZE] = {0};
+    Wire.write(emptyFrame, I2C_FRAME_SIZE);
+    break;
+  }
   }
 }
 
@@ -207,16 +254,14 @@ void setup()
 {
   Serial.begin(115200);
 
-  // Define pin modes for TX and RX
-  pinMode(rxPin, INPUT);
-  pinMode(txPin, OUTPUT);
   pinMode(BLUE_LED_PIN, OUTPUT); // 本体LED青
 
   digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
-    
-  // Set the baud rate for the Hardware UART1 object
-  // ハードウェアUARTは自動バッファ管理（より安定した通信）
-  SerialUART.begin(115200, SERIAL_8N1, rxPin, txPin);
+
+  // I2Cスレーブとして初期化し、M5Stack Basicからの要求に応答する
+  Wire.begin(I2C_SLAVE_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.onReceive(onI2CReceive);
+  Wire.onRequest(onI2CRequest);
 
   BLEDevice::init("M5NanoC6 BLE Client");
 
