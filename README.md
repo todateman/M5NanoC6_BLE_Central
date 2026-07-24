@@ -1,6 +1,6 @@
 ﻿# M5NanoC6 BLE Central
 
-[M5NanoC6](https://docs.m5stack.com/ja/core/M5NanoC6)（ESP32-C6) を使用した BLE Central (クライアント) 実装サンプルです。  
+[M5NanoC6](https://docs.m5stack.com/ja/core/M5NanoC6)（ESP32-C6） を使用した BLE Central (クライアント) 実装サンプルです。  
 M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために M5NanoC6 を外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを Grove ポート経由の I2C スレーブとして保持し、M5Stack Basic（I2C マスター）からの読み出し要求に応じて返します。  
 （I2Cスレーブアドレス: 0x08, SDA=GPIO2, SCL=GPIO1）
 
@@ -41,7 +41,7 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
    - Notify キャラクタリスティック購読登録
 4. Notify 受信:
    - 青色 LED 点灯 (次ループで消灯)
-   - 改行までのデータを I2C 送信用フレーム (`i2cTxFrame`) に格納・保持し、M5Stack Basic からの要求を待機
+   - 改行までのデータを先頭タグ（`PRI:` / `SEC:` / `FUEL:` / タグなし）で判別し、対応する I2C 送信用フレーム（`priPreFrame` / `secPreFrame` / `fuelPreFrame` / `engineTempFrame`）に格納・保持し、M5Stack Basic からの要求を待機
 5. 切断イベント発生時:
    - `onDisconnect` で state を IDLE に戻すのみ  
      (現状: 自動再スキャン未実装 / 改善予定)
@@ -66,9 +66,18 @@ include/, lib/, test/ README のみ (拡張用)
 
 - スレーブアドレス: `0x08`
 - ピン: SDA=GPIO2, SCL=GPIO1（Grove ポート）
-- コマンド方式: マスターは読み出し前に1バイトのコマンドコードを書き込み、どのデータを要求するかを明示する（今後 M5NanoC6 で他のデータも中継する場合に備えた設計）
-  - `CMD_ENGINE_TEMP` (`0x01`): エンジン温度データを要求
+- コマンド方式: マスターは読み出し前に1バイトのコマンドコードを書き込み、どのデータを要求するかを明示する
+  - `CMD_ENGINE_TEMP` (`0x01`): <https://github.com/todateman/Chibi-T_Furoshiki_Heater> からエンジン温度データ (*.**°Ｃ) を要求
+  - `CMD_PRI_PRE` (`0x02`): <https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust> から1次側空気圧センサデータ (*.**MPa) を要求
+  - `CMD_SEC_PRE` (`0x03`): <https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust> から2次側空気圧センサデータ (*.**MPa) を要求
+  - `CMD_FUEL_PRE` (`0x04`): <https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust> から燃圧センサデータ (*.**MPa) を要求
   - 未定義のコマンドを書き込んだ場合は長さ0（先頭バイトが `0x00`）の空フレームを返す
+  - `CMD_PRI_PRE` / `CMD_SEC_PRE` / `CMD_FUEL_PRE` の3つは同一の BLE ペリフェラル（M5Core2、Chibi-T_Furoshiki_AutoAirAdjust）から届く。  
+  ペリフェラル側は1本の Notify Characteristic で3種類のデータを送るため、M5NanoC6 は改行区切りメッセージの先頭タグでデータ種別を判別し、それぞれ専用フレームに格納する
+    - `PRI:` → `CMD_PRI_PRE` 用フレーム（例: `PRI:0.85\n`）
+    - `SEC:` → `CMD_SEC_PRE` 用フレーム（例: `SEC:0.72\n`）
+    - `FUEL:` → `CMD_FUEL_PRE` 用フレーム（例: `FUEL:2.10\n`）
+    - いずれのタグにも一致しないメッセージは従来どおり `CMD_ENGINE_TEMP` 用フレームに格納する（後方互換）
 - フレーム形式: 32バイト固定
   - `[0]`: データ長 (0〜31)
   - `[1..31]`: データ本体（余りはゼロ埋め）
@@ -84,16 +93,20 @@ include/, lib/, test/ README のみ (拡張用)
 #define I2C_SLAVE_ADDR 0x08
 #define I2C_FRAME_SIZE 32
 #define CMD_ENGINE_TEMP 0x01
+#define CMD_PRI_PRE 0x02
+#define CMD_SEC_PRE 0x03
+#define CMD_FUEL_PRE 0x04
 
 void setup() {
   M5.begin();
   Wire.begin(21, 22); // Grove Port A (SDA, SCL)
 }
 
-void loop() {
+// コマンドを指定してフレームを読み出し、シリアルに表示する
+void requestAndPrint(uint8_t command, const char *label) {
   // 1. コマンドを書き込み、要求するデータの種類を伝える
   Wire.beginTransmission(I2C_SLAVE_ADDR);
-  Wire.write(CMD_ENGINE_TEMP);
+  Wire.write(command);
   Wire.endTransmission();
 
   // 2. フレームを読み出す
@@ -109,8 +122,16 @@ void loop() {
     for (int i = 0; i < len; i++) {
       data += (char)frame[1 + i];
     }
-    Serial.println(data); // 受信データ（エンジン温度）を表示
+    Serial.printf("%s: %s\n", label, data.c_str());
   }
+}
+
+void loop() {
+  // エンジン温度、1次側/2次側空気圧、燃圧をそれぞれ要求して表示
+  requestAndPrint(CMD_ENGINE_TEMP, "ENGINE_TEMP");
+  requestAndPrint(CMD_PRI_PRE, "PRI_PRE");
+  requestAndPrint(CMD_SEC_PRE, "SEC_PRE");
+  requestAndPrint(CMD_FUEL_PRE, "FUEL_PRE");
 
   delay(500); // ポーリング間隔
 }
@@ -154,7 +175,7 @@ Notify callback for characteristic ... of data length N
 - I2Cスレーブアドレス: `#define I2C_SLAVE_ADDR 0x08` で変更可
 - I2Cピン: `#define I2C_SDA_PIN 2`, `#define I2C_SCL_PIN 1` (Grove ポート)
 - フレームサイズ: `#define I2C_FRAME_SIZE 32` で変更可（データ本体は `I2C_FRAME_SIZE - 1` バイトまで）
-- コマンド: `#define CMD_ENGINE_TEMP 0x01` に加え、他のデータを中継する場合は新しいコマンド定数とフレーム/ハンドリングを追加
+- コマンド: `CMD_ENGINE_TEMP` / `CMD_PRI_PRE` / `CMD_SEC_PRE` / `CMD_FUEL_PRE` を定義済み。さらに他のデータを中継する場合は新しいコマンド定数とフレーム/ハンドリング（および必要ならタグ文字列）を追加
 - LED ピン: `#define BLUE_LED_PIN 7`
 - UUID: `#define SERVICE_UUID ...` 等で差し替え可能
 - 再接続ポリシー: 現状は切断後 IDLE のみ。`onDisconnect` 内で `scan()` を再呼出すか状態追加予定
@@ -174,4 +195,4 @@ Notify callback for characteristic ... of data length N
 本ソフトウェアは MIT License です。`LICENSE` を参照してください。
 
 ---
-ドキュメント最終更新: 2026-07-25 (I2Cスレーブ化)
+ドキュメント最終更新: 2026-07-25 (M5Core2からの3センサーデータ中継対応)

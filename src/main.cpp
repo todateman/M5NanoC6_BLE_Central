@@ -13,8 +13,17 @@
 #define I2C_SLAVE_ADDR 0x08
 #define I2C_FRAME_SIZE 32  // 1byte長さ + 最大31byteデータ
 
-// マスターが要求するデータの種類を表すコマンド（今後他のデータを中継する場合はここに追加）
+// マスターが要求するデータの種類を表すコマンド
 #define CMD_ENGINE_TEMP 0x01
+#define CMD_PRI_PRE 0x02
+#define CMD_SEC_PRE 0x03
+#define CMD_FUEL_PRE 0x04
+
+// M5Core2 (Chibi-T_Furoshiki_AutoAirAdjust) は1本のNotify Characteristicで
+// 3種類のセンサーデータを送るため、先頭のタグ文字列で種別を判別する
+#define TAG_PRI_PRE "PRI:"
+#define TAG_SEC_PRE "SEC:"
+#define TAG_FUEL_PRE "FUEL:"
 
 #define BLUE_LED_PIN 7  // 青色LED端子番号
 
@@ -38,8 +47,11 @@ static const unsigned long LED_ON_DURATION = 500;  // LED点灯時間（ミリ�
 static String rxBuffer = "";
 static const size_t RX_BUFFER_MAX = 256;  // 最大バッファサイズ
 
-// エンジン温度のI2C送信用フレーム（先頭1byteが長さ、以降が実データ）。M5Stack Basicからの要求時に最新値を返す
+// 各データのI2C送信用フレーム（先頭1byteが長さ、以降が実データ）。M5Stack Basicからの要求時に最新値を返す
 static uint8_t engineTempFrame[I2C_FRAME_SIZE] = {0};
+static uint8_t priPreFrame[I2C_FRAME_SIZE] = {0};
+static uint8_t secPreFrame[I2C_FRAME_SIZE] = {0};
+static uint8_t fuelPreFrame[I2C_FRAME_SIZE] = {0};
 
 // マスターが直前に書き込んできたコマンド（onReceiveで更新し、onRequestで参照する）
 static uint8_t lastCommand = 0x00;
@@ -78,6 +90,18 @@ class MyClientCallbacks : public BLEClientCallbacks
   }
 };
 
+// 文字列データを長さプレフィックス付きのI2C送信用フレームに変換して格納する
+static void updateFrame(uint8_t *frame, const String &value)
+{
+  size_t dataLen = min(value.length(), (size_t)(I2C_FRAME_SIZE - 1));
+  frame[0] = (uint8_t)dataLen;
+  memcpy(&frame[1], value.c_str(), dataLen);
+  if (dataLen < I2C_FRAME_SIZE - 1)
+  {
+    memset(&frame[1 + dataLen], 0, I2C_FRAME_SIZE - 1 - dataLen);
+  }
+}
+
 static void notifyCallback(
     BLERemoteCharacteristic *pBLERemoteCharacteristic,
     uint8_t *pData,
@@ -101,20 +125,30 @@ static void notifyCallback(
       // 改行を受信 → メッセージ完成
       Serial.print("Complete message: ");
       Serial.println(rxBuffer.c_str());
-      
-      // エンジン温度フレームを更新（CMD_ENGINE_TEMP要求時にこの内容を返す）
-      size_t dataLen = min(rxBuffer.length(), (size_t)(I2C_FRAME_SIZE - 1));
-      engineTempFrame[0] = (uint8_t)dataLen;
-      memcpy(&engineTempFrame[1], rxBuffer.c_str(), dataLen);
-      if (dataLen < I2C_FRAME_SIZE - 1)
+
+      // 先頭のタグでデータ種別を判別し、対応するフレームを更新する
+      // （タグが無い場合は従来どおりCMD_ENGINE_TEMP用として扱う）
+      if (rxBuffer.startsWith(TAG_PRI_PRE))
       {
-        memset(&engineTempFrame[1 + dataLen], 0, I2C_FRAME_SIZE - 1 - dataLen);
+        updateFrame(priPreFrame, rxBuffer.substring(strlen(TAG_PRI_PRE)));
+        Serial.println("I2C frame updated: PRI_PRE");
+      }
+      else if (rxBuffer.startsWith(TAG_SEC_PRE))
+      {
+        updateFrame(secPreFrame, rxBuffer.substring(strlen(TAG_SEC_PRE)));
+        Serial.println("I2C frame updated: SEC_PRE");
+      }
+      else if (rxBuffer.startsWith(TAG_FUEL_PRE))
+      {
+        updateFrame(fuelPreFrame, rxBuffer.substring(strlen(TAG_FUEL_PRE)));
+        Serial.println("I2C frame updated: FUEL_PRE");
+      }
+      else
+      {
+        updateFrame(engineTempFrame, rxBuffer);
+        Serial.println("I2C frame updated: ENGINE_TEMP");
       }
 
-      Serial.print("I2C frame updated: ");
-      Serial.print(dataLen);
-      Serial.println(" bytes");
-      
       // バッファクリア
       rxBuffer = "";
     }
@@ -162,6 +196,15 @@ void onI2CRequest()
   {
   case CMD_ENGINE_TEMP:
     Wire.write(engineTempFrame, I2C_FRAME_SIZE);
+    break;
+  case CMD_PRI_PRE:
+    Wire.write(priPreFrame, I2C_FRAME_SIZE);
+    break;
+  case CMD_SEC_PRE:
+    Wire.write(secPreFrame, I2C_FRAME_SIZE);
+    break;
+  case CMD_FUEL_PRE:
+    Wire.write(fuelPreFrame, I2C_FRAME_SIZE);
     break;
   default:
   {
