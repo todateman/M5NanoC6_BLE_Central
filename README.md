@@ -7,7 +7,7 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
 ## 特徴
 
 - Arduino フレームワーク (esp32-arduino)
-- BLE Central: 指定サービス UUID をスキャン → 接続 → Notify 購読
+- BLE Central: Heater / AutoAirAdjust 2台の BLE ペリフェラルに**同時接続**（Service UUID は共通のため、アドバタイズ名で判別）→ Notify 購読
 - Notify 受信で LED(青) 点灯し、受信データを32バイト固定フレームに格納して保持
 - Grove ポートを I2C スレーブ化 (アドレス 0x08、コマンドで要求データの種類を指定して応答)
 - PlatformIO プロジェクト構成 (複数 env 拡張可能)
@@ -18,38 +18,61 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
 
 - M5Stack NanoC6 (ESP32-C6) ボード
 - Grove ポート接続先: M5Stack Basic（I2C マスター、Port A: G21=SDA, G22=SCL 想定）
-- 接続先 BLE ペリフェラル (後述 UUID 実装)
+- 接続先 BLE ペリフェラル (後述 UUID 実装、以下の2台)
+  - [Chibi-T_Furoshiki_Heater](https://github.com/todateman/Chibi-T_Furoshiki_Heater)（M5DinMeter、エンジン温度）
+  - [Chibi-T_Furoshiki_AutoAirAdjust](https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust)（M5Core2、1次側/2次側空気圧・燃圧）
 - 電源: USB 5V または Grove 5V 給電
 - 動作環境: 屋内 / 屋根のある屋外
 
 ## BLE UUID 一覧
 
+Service UUID は両ペリフェラルで共通のため、接続先の判別は BLE アドバタイズ名（`getName()`）で行います。
+
 | 用途 | UUID |
 | ---- | ---- |
-| Service | `7c44181A-c1a4-4635-a119-b490ed272552` |
-| Write Characteristic | `7c442A00-c1a4-4635-a119-b490ed272552` |
+| Service（共通） | `7c44181A-c1a4-4635-a119-b490ed272552` |
+
+### Chibi-T_Furoshiki_Heater (M5DinMeter)
+
+- アドバタイズ名: `M5Din Furoshiki Heater`
+
+| 用途 | UUID |
+| ---- | ---- |
+| Write Characteristic（存在確認用、実データなし） | `7c442A00-c1a4-4635-a119-b490ed272552` |
 | Notify Characteristic | `7c442A6E-c1a4-4635-a119-b490ed272552` |
 
-※ UUID は Version4 で生成。ペリフェラル側が同一 UUID を持つ必要があります。
+### Chibi-T_Furoshiki_AutoAirAdjust (M5Core2)
+
+- アドバタイズ名: `ChibiT-AutoAirAdjust`
+- 実装元: [feature/BLE ブランチ, commit 5b8b8aa](https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust)
+
+| 用途 | UUID |
+| ---- | ---- |
+| Write Characteristic（存在確認用、実データなし） | `c9f878f1-c311-4452-ae5e-e813b4fe057d` |
+| Notify Characteristic | `1d25ec49-e19c-4bb6-8c36-5dc8d8aaaebe` |
+
+※ UUID は Version4 で生成。ペリフェラル側が同一 UUID を持つ必要があります（Service UUID のみ共通、Characteristic UUID はペリフェラルごとに異なります）。
 
 ## 動作概要
 
-1. 起動時に BLE 初期化し 5 秒間パッシブスキャン
-2. 指定サービス UUID を検出すると接続要求
+1. 起動時に BLE 初期化し、アクティブスキャンを開始  
+   （Service UUID は共通のため、アドバタイズ名で Heater / AutoAirAdjust を判別する。両者ともデバイス名が Scan Response 側に含まれるため、名前判別にはアクティブスキャンが必須）
+2. 対象デバイスを検出すると接続要求（見つかった方から順に、部分的な接続を許容。片方だけでも正常に動作する）
 3. 接続後:
    - Write キャラクタリスティック存在確認 (現状未使用／将来拡張枠)
    - Notify キャラクタリスティック購読登録
 4. Notify 受信:
    - 青色 LED 点灯 (次ループで消灯)
    - 改行までのデータを先頭タグ（`PRI:` / `SEC:` / `FUEL:` / タグなし）で判別し、対応する I2C 送信用フレーム（`priPreFrame` / `secPreFrame` / `fuelPreFrame` / `engineTempFrame`）に格納・保持し、M5Stack Basic からの要求を待機
-5. 切断イベント発生時:
-   - `onDisconnect` で state を IDLE に戻すのみ  
-     (現状: 自動再スキャン未実装 / 改善予定)
+   - Heater / AutoAirAdjust それぞれ専用の受信バッファを保持するため、2台からの Notify が混ざることはない
+5. 未発見のペリフェラルが残っている限り、スキャンを継続する
+6. 切断イベント発生時:
+   - 切断されたペリフェラルのみ状態をリセットし、次のスキャンで自動的に再接続を試みる（もう一方の接続は維持される）
 
 ### シンプルなデータフロー（論理）
 
 ```text
-BLE Peripheral --(Notify: 文字列データ)--> M5NanoC6 (I2Cスレーブ, addr=0x08) <--(I2C要求/応答)-- M5Stack Basic (I2Cマスター)
+Heater / AutoAirAdjust --(Notify: 文字列データ)--> M5NanoC6 (I2Cスレーブ, addr=0x08) <--(I2C要求/応答)-- M5Stack Basic (I2Cマスター)
 ```
 
 ## ソース構成
@@ -63,6 +86,8 @@ include/, lib/, test/ README のみ (拡張用)
 ```
 
 ## I2C通信仕様
+
+AutoAirAdjust 側の BLE 送信機能は [feature/BLE ブランチ, commit 5b8b8aa](https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust) で実装済みで、本 Central 側も対応済みです。
 
 - スレーブアドレス: `0x08`
 - ピン: SDA=GPIO2, SCL=GPIO1（Grove ポート）
@@ -161,8 +186,14 @@ pio device monitor -b 115200
 
 ```text
 Advertised Device: <device info>
-Device found!
-Connected to server
+Device found! (M5Din Furoshiki Heater)
+Advertised Device: <device info>
+Device found! (ChibiT-AutoAirAdjust)
+Connected to server (M5Din Furoshiki Heater)
+ - Found our service
+ - Found our characteristic
+ - Registered for notify
+Connected to server (ChibiT-AutoAirAdjust)
  - Found our service
  - Found our characteristic
  - Registered for notify
@@ -171,20 +202,23 @@ Notify callback for characteristic ... of data length N
 
 ## カスタマイズポイント
 
-- スキャン時間: `scan()` 内 `pBLEScan->start(5, false);`
+- スキャン時間: `#define SCAN_DURATION_SEC 5`
 - I2Cスレーブアドレス: `#define I2C_SLAVE_ADDR 0x08` で変更可
 - I2Cピン: `#define I2C_SDA_PIN 2`, `#define I2C_SCL_PIN 1` (Grove ポート)
 - フレームサイズ: `#define I2C_FRAME_SIZE 32` で変更可（データ本体は `I2C_FRAME_SIZE - 1` バイトまで）
 - コマンド: `CMD_ENGINE_TEMP` / `CMD_PRI_PRE` / `CMD_SEC_PRE` / `CMD_FUEL_PRE` を定義済み。さらに他のデータを中継する場合は新しいコマンド定数とフレーム/ハンドリング（および必要ならタグ文字列）を追加
 - LED ピン: `#define BLUE_LED_PIN 7`
-- UUID: `#define SERVICE_UUID ...` 等で差し替え可能
-- 再接続ポリシー: 現状は切断後 IDLE のみ。`onDisconnect` 内で `scan()` を再呼出すか状態追加予定
+- UUID: `SERVICE_UUID`（共通）/ `HEATER_CHARACTERISTIC_UUID` / `HEATER_NOTIFY_CHARACTERISTIC_UUID` / `AUTOAIR_CHARACTERISTIC_UUID` / `AUTOAIR_NOTIFY_CHARACTERISTIC_UUID` で差し替え可能
+- デバイス名フィルタ: `HEATER_DEVICE_NAME` / `AUTOAIR_DEVICE_NAME`（接続先の判別に使用、Service UUID が共通のため必須）
+- 再接続ポリシー: 切断されたペリフェラルのみ `resetPeripheral()` で状態をリセットし、次の `scan()` で自動的に再接続を試みる（もう一方の接続には影響しない）
 
 ## 今後の改善案
 
-- 接続失敗/切断後の自動再スキャンループ（指数バックオフ or 一定間隔）
 - float16 → float32 変換/スケーリングユーティリティ
-- 省電力 (スキャン間隔調整 / Wi-Fi 無効化)
+- アクティブスキャンによる消費電力増への対応（必要ならスキャン間隔/ウィンドウの調整）
+- 3台目以降のペリフェラル追加が必要になった場合の汎用化（現状は Heater/AutoAirAdjust の2台固定の意図的な設計）
+- 再接続の待機/バックオフ（現状は見つかり次第即座に再接続を試みるのみ）
+- Notify データのタイムアウト検知（一定時間 Notify が来ない場合に「値が古い」ことを判別する仕組み）
 - Write キャラクタリスティック活用 (将来の制御コマンド)
 - データ検証 (CRC / バージョン / シーケンス番号)
 - LED 点灯時間制御 (非同期タイマ) および点滅パターンで状態表示
@@ -195,4 +229,4 @@ Notify callback for characteristic ... of data length N
 本ソフトウェアは MIT License です。`LICENSE` を参照してください。
 
 ---
-ドキュメント最終更新: 2026-07-25 (M5Core2からの3センサーデータ中継対応)
+ドキュメント最終更新: 2026-07-25 (Heater/AutoAirAdjust 同時接続対応)
