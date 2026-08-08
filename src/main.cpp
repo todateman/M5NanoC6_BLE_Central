@@ -304,9 +304,10 @@ static bool onI2CReceiveDone(i2c_slave_dev_handle_t handle,
   return hpw == pdTRUE;
 }
 
-// M5Stack Basic（I2Cマスター）の読み出し要求でSCLがストレッチされた瞬間にISRコンテキストで呼ばれる。
-// ドライバはこのコールバックが返った直後に無条件でストレッチを解除するため、ここでは応答データを
-// 用意できない（Serial出力もISRからは非安全なため行わない）。カウントのみ記録し、タスク側で参照する
+// クロックストレッチ発生時にISRコンテキストで呼ばれる（現在はflags.stretch_en=0のため通常は
+// 発火しない。診断用に残してあるだけで、カウントが増えていれば何らかの理由でストレッチが
+// 発生していることが分かる。ドライバはこのコールバックが返った直後に無条件でストレッチを
+// 解除するため、ここでは応答データを用意できない（Serial出力もISRからは非安全なため行わない）
 static bool onI2CStretch(i2c_slave_dev_handle_t handle,
                           const i2c_slave_stretch_event_data_t *evt, void *arg)
 {
@@ -442,7 +443,13 @@ void setup()
   i2cSlaveConfig.send_buf_depth = 64;  // I2C_FRAME_SIZE(32)以上を確保
   i2cSlaveConfig.slave_addr = I2C_SLAVE_ADDR;
   i2cSlaveConfig.addr_bit_len = I2C_ADDR_BIT_LEN_7;
-  i2cSlaveConfig.flags.stretch_en = 1;  // 応答準備が万一遅れた場合の保険として有効化
+  // クロックストレッチは無効化する。BLEスキャン等でCPUが混雑している状況では
+  // ストレッチの解除(ISR処理)自体が遅延し、マスター側からはSCLが長時間(観測上約1秒)
+  // Low に張り付いたように見え、Wire.setTimeOut()では救えないバス全体のスタックを
+  // 引き起こしていた。応答フレームはコマンド受信完了(onI2CReceiveDone)の時点で
+  // 事前に用意しているため、ストレッチが無くても通常は間に合う。万一間に合わなくても
+  // 「ストレッチ無し」なら単に空/古いフレームが返るだけで、バスは長時間ブロックしない
+  i2cSlaveConfig.flags.stretch_en = 0;
 
   ESP_ERROR_CHECK(i2c_new_slave_device(&i2cSlaveConfig, &i2cSlaveHandle));
 
