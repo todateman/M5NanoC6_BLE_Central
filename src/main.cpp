@@ -1,15 +1,16 @@
-// 参考
-// https://github.com/espressif/arduino-esp32/blob/master/libraries/BLE/examples/BLE_client/BLE_client.ino
-// https://qiita.com/Teach/items/629c338da05a3134a1eb#%E3%82%B9%E3%83%86%E3%83%83%E3%83%976-notify
-// https://github.com/teach310/AtomLiteSample/blob/d275df573c59a7d9ced38330498d182313b69bd8/src/main.cpp
+// 参考 (Adafruit_nRF52_Arduino / Bluefruit52Lib 付属サンプル)
+// https://github.com/adafruit/Adafruit_nRF52_Arduino/blob/master/libraries/Bluefruit52Lib/examples/Central/central_custom_hrm/central_custom_hrm.ino
+// https://github.com/adafruit/Adafruit_nRF52_Arduino/blob/master/libraries/Bluefruit52Lib/examples/Central/central_bleuart_multi/central_bleuart_multi.ino
+// https://github.com/adafruit/Adafruit_nRF52_Arduino/blob/master/libraries/Bluefruit52Lib/examples/Central/central_scan_advanced/central_scan_advanced.ino
+// https://github.com/adafruit/Adafruit_nRF52_Arduino/blob/master/libraries/Wire/examples/secondary_receiver/secondary_receiver.ino
+// https://github.com/adafruit/Adafruit_nRF52_Arduino/blob/master/libraries/Wire/examples/secondary_sender/secondary_sender.ino
 
 #include <Arduino.h>
-#include <BLEDevice.h>
-#include "driver/i2c_slave.h"
+#include <bluefruit.h>
+#include <Wire.h>
 
-// Grove Port -> I2C (M5Stack Basicをマスターとするスレーブとして動作)
-#define I2C_SCL_PIN 1
-#define I2C_SDA_PIN 2
+// I2C(Wire)はXiao nRF52840の既定ピン(D4=SDA, D5=SCL)をそのまま使う。
+// Grove非搭載のため、M5Stack Basicへは直結配線 or Xiao Expansion Board等を介して接続する
 #define I2C_SLAVE_ADDR 0x08
 #define I2C_FRAME_SIZE 32  // 1byte長さ + 最大31byteデータ
 
@@ -25,7 +26,10 @@
 #define TAG_SEC_PRE "SEC:"
 #define TAG_FUEL_PRE "FUEL:"
 
-#define BLUE_LED_PIN 7  // 青色LED端子番号
+// オンボードRGB LEDの青色を使用(Xiao nRF52840はGrove非搭載のため外付けLEDではなく内蔵LEDを流用)。
+// LED_BLUE/LED_STATE_ON はvariant.hで定義される(Xiao nRF52840はactive-high。
+// digitalWrite(BLUE_LED_PIN, LED_STATE_ON)で点灯、!LED_STATE_ONで消灯すれば極性を意識せず書ける)
+#define BLUE_LED_PIN LED_BLUE
 
 // ServerのBLE サービスとキャラクタリスティックのUUIDを定義 https://www.uuidgenerator.net/version4
 // SERVICE_UUIDはHeater/AutoAirAdjustで共通のため、接続先の判別はアドバタイズ名で行う
@@ -41,8 +45,6 @@
 #define AUTOAIR_CHARACTERISTIC_UUID "c9f878f1-c311-4452-ae5e-e813b4fe057d"
 #define AUTOAIR_NOTIFY_CHARACTERISTIC_UUID "1d25ec49-e19c-4bb6-8c36-5dc8d8aaaebe"
 
-#define SCAN_DURATION_SEC 5  // 1回のスキャン時間（秒）。特に意味のある値ではない
-
 static unsigned long ledOnTime = 0;  // LED点灯開始時刻
 static const unsigned long LED_ON_DURATION = 500;  // LED点灯時間（ミリ秒）
 static const size_t RX_BUFFER_MAX = 256;  // Notify受信バッファの最大サイズ
@@ -52,26 +54,6 @@ static uint8_t engineTempFrame[I2C_FRAME_SIZE] = {0};
 static uint8_t priPreFrame[I2C_FRAME_SIZE] = {0};
 static uint8_t secPreFrame[I2C_FRAME_SIZE] = {0};
 static uint8_t fuelPreFrame[I2C_FRAME_SIZE] = {0};
-
-// マスターが直前に書き込んできたコマンド（受信コールバックで更新し、送信処理で参照する）
-static volatile uint8_t lastCommand = 0x00;
-
-// ESP-IDFネイティブI2Cスレーブドライバ関連
-// (ESP32-C6はarduino-esp32のWireライブラリのスレーブ読み取り要求(onRequest)が
-//  構造的に発火しない既知の制限があるため、Wireを使わずdriver/i2c_slave.hを直接使う)
-//
-// 重要: ESP-IDF(v5.5)のi2c_slave.c実装では、on_stretch_occurコールバックが
-// 返った直後にドライバ側が無条件でクロックストレッチを解除する(i2c_ll_slave_clear_stretch)。
-// そのためストレッチ発生(＝読み取り開始)を検知してからタスク経由で応答データを
-// 用意していては確実に間に合わない。応答フレームは、その直前に完了している
-// 「コマンドバイトの書き込み(onI2CReceiveDone)」の時点で用意し、i2c_slave_transmit()で
-// TXリングバッファへ積んでおく必要がある(読み取り開始時にはFIFOに既にデータがある状態にする)。
-static i2c_slave_dev_handle_t i2cSlaveHandle = nullptr;
-static TaskHandle_t i2cSlaveTaskHandle = nullptr;
-static uint8_t i2cCmdBuffer[1];  // 受信コマンドバイト用バッファ
-static volatile uint32_t i2cStretchEventCount = 0;  // 診断用(ISRからのインクリメントのみ、ログはタスク側で出す)
-// setup()と再初期化(resetI2CSlaveDevice)の両方から使うためファイルスコープに置く
-static i2c_slave_config_t i2cSlaveConfig = {};
 
 #define STATE_IDLE 0
 #define STATE_DO_CONNECT 1
@@ -85,50 +67,48 @@ static i2c_slave_config_t i2cSlaveConfig = {};
 // (Heater/AutoAirAdjustの2台構成に特化しており、3台目以降への汎用対応は意図しない)
 struct PeripheralContext
 {
-  const char *name;                    // アドバタイズ名（判別用）
-  BLEUUID charUUID;                    // 存在確認用キャラクタリスティック
-  BLEUUID notifyCharUUID;              // Notifyキャラクタリスティック
-  BLEAdvertisedDevice *pPeripheral;    // スキャンで発見したデバイス
-  BLERemoteCharacteristic *pRemoteCharacteristic;
-  BLERemoteCharacteristic *pNotifyCharacteristic;
-  int8_t state;                        // STATE_IDLE / STATE_DO_CONNECT / STATE_CONNECTED
-  String rxBuffer;                     // このペリフェラル専用のNotify受信バッファ
+  const char *name;                        // アドバタイズ名（判別用）
+  BLEClientService service;                // 共通SERVICE_UUIDのサービス
+  BLEClientCharacteristic charac;          // 存在確認用キャラクタリスティック
+  BLEClientCharacteristic notifyCharac;    // Notifyキャラクタリスティック
+  uint16_t connHandle;                     // 接続確立後のコネクションハンドル
+  int8_t state;                            // STATE_IDLE / STATE_DO_CONNECT / STATE_CONNECTED
+  String rxBuffer;                         // このペリフェラル専用のNotify受信バッファ
 };
 
-static BLEUUID serviceUUID(SERVICE_UUID);
+// Service UUIDはHeater/AutoAirAdjustで共通のため1つを使い回す(Scannerのフィルタにも使用)
+static BLEUuid serviceUuid(SERVICE_UUID);
 
 static PeripheralContext peripherals[PERIPH_COUNT] = {
     // Heater: エンジン温度(タグなし文字列)を送信
-    {HEATER_DEVICE_NAME, BLEUUID(HEATER_CHARACTERISTIC_UUID), BLEUUID(HEATER_NOTIFY_CHARACTERISTIC_UUID),
-     nullptr, nullptr, nullptr, STATE_IDLE, ""},
+    {HEATER_DEVICE_NAME, BLEClientService(serviceUuid),
+     BLEClientCharacteristic(HEATER_CHARACTERISTIC_UUID),
+     BLEClientCharacteristic(HEATER_NOTIFY_CHARACTERISTIC_UUID),
+     BLE_CONN_HANDLE_INVALID, STATE_IDLE, ""},
     // AutoAirAdjust: 1次/2次側空気圧・燃圧(PRI:/SEC:/FUEL:タグ付き)を送信
-    {AUTOAIR_DEVICE_NAME, BLEUUID(AUTOAIR_CHARACTERISTIC_UUID), BLEUUID(AUTOAIR_NOTIFY_CHARACTERISTIC_UUID),
-     nullptr, nullptr, nullptr, STATE_IDLE, ""},
+    {AUTOAIR_DEVICE_NAME, BLEClientService(serviceUuid),
+     BLEClientCharacteristic(AUTOAIR_CHARACTERISTIC_UUID),
+     BLEClientCharacteristic(AUTOAIR_NOTIFY_CHARACTERISTIC_UUID),
+     BLE_CONN_HANDLE_INVALID, STATE_IDLE, ""},
 };
 
-static BLEScan *pBLEScan;  // setup()で取得し使い回す
-
-// 指定ペリフェラルの状態を初期化し、次のscan()で再発見できるようにする
+// 指定ペリフェラルの状態を初期化し、次のscanCallback()で再発見できるようにする
 static void resetPeripheral(int idx)
 {
   PeripheralContext &p = peripherals[idx];
-  if (p.pPeripheral != nullptr)
-  {
-    delete p.pPeripheral;
-    p.pPeripheral = nullptr;
-  }
-  p.pRemoteCharacteristic = nullptr;
-  p.pNotifyCharacteristic = nullptr;
+  p.connHandle = BLE_CONN_HANDLE_INVALID;
   p.rxBuffer = "";
   p.state = STATE_IDLE;
+  // service/characteristicの探索状態はBluefruitが切断イベントで内部的にリセットするため、
+  // ESP32-C6版のようなヒープ管理(delete)は不要
 }
 
-// 未発見(STATE_IDLE)のペリフェラルが1台でも残っていればスキャンが必要
+// 未接続(STATE_CONNECTED以外)のペリフェラルが1台でも残っていればスキャンが必要
 static bool needsScan()
 {
   for (int i = 0; i < PERIPH_COUNT; i++)
   {
-    if (peripherals[i].state == STATE_IDLE)
+    if (peripherals[i].state != STATE_CONNECTED)
     {
       return true;
     }
@@ -136,72 +116,23 @@ static bool needsScan()
   return false;
 }
 
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
+// アドバタイズ名からペリフェラルのインデックスを引く
+static int findPeripheralByName(const char *name)
 {
-  void onResult(BLEAdvertisedDevice advertisedDevice)
+  for (int i = 0; i < PERIPH_COUNT; i++)
   {
-    // 周囲のBLEデバイスすべてに対して呼ばれるため、無条件のSerial.printf(CORE_DEBUG_LEVELの
-    // 制御対象外で常に出力される)は周辺機器の多い環境ではCPU/シリアル送信時間を大きく消費し、
-    // I2C応答タスクのスケジューリング遅延（TXリングバッファのオーバーフロー）の一因になっていた。
-    // 対象のService UUIDを持つデバイスのみログを出す
-    if (!advertisedDevice.haveServiceUUID() || !advertisedDevice.isAdvertisingService(serviceUUID))
+    if (strcmp(name, peripherals[i].name) == 0)
     {
-      return;
-    }
-    Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str());
-
-    // Service UUIDはHeater/AutoAirAdjustで共通のため、アドバタイズ名でどちらかを判別する
-    String name = advertisedDevice.getName().c_str();
-    for (int i = 0; i < PERIPH_COUNT; i++)
-    {
-      if (peripherals[i].pPeripheral != nullptr)
-      {
-        continue;  // 既に発見済み
-      }
-      if (name != peripherals[i].name)
-      {
-        continue;
-      }
-      Serial.printf("Device found! (%s)\n", peripherals[i].name);
-      peripherals[i].pPeripheral = new BLEAdvertisedDevice(advertisedDevice);
-      peripherals[i].state = STATE_DO_CONNECT;
-      break;
-    }
-
-    // 両方とも発見済みならこれ以上スキャンを続ける必要はない
-    if (peripherals[PERIPH_HEATER].pPeripheral != nullptr &&
-        peripherals[PERIPH_AUTOAIR].pPeripheral != nullptr)
-    {
-      advertisedDevice.getScan()->stop();
+      return i;
     }
   }
-};
-
-class MyClientCallbacks : public BLEClientCallbacks
-{
-public:
-  explicit MyClientCallbacks(int idx) : peripheralIndex(idx) {}
-
-  void onConnect(BLEClient *pclient)
-  {
-    Serial.printf("onConnect (%s)\n", peripherals[peripheralIndex].name);
-    peripherals[peripheralIndex].state = STATE_CONNECTED;
-  }
-
-  void onDisconnect(BLEClient *pclient)
-  {
-    Serial.printf("onDisconnect (%s)\n", peripherals[peripheralIndex].name);
-    resetPeripheral(peripheralIndex);  // 再スキャンで再発見できるようにする
-  }
-
-private:
-  int peripheralIndex;
-};
+  return -1;
+}
 
 // 文字列データを長さプレフィックス付きのI2C送信用フレームに変換して格納する。
 // 末尾1byte(frame[I2C_FRAME_SIZE-1])はコマンドエコー用に予約し、ここでは触れない
-// (実際の値はi2cSlaveTaskが送信直前に設定する。マスター側でコマンドと応答のズレを
-//  検知できるようにするための仕組み。詳細はi2cSlaveTaskのコメント参照)
+// (実際の値はreceiveEventが書き込み直前に設定する。マスター側でコマンドと応答のズレを
+//  検知できるようにするための仕組み)
 static void updateFrame(uint8_t *frame, const String &value)
 {
   size_t dataLen = min(value.length(), (size_t)(I2C_FRAME_SIZE - 2));
@@ -213,17 +144,13 @@ static void updateFrame(uint8_t *frame, const String &value)
   }
 }
 
-static void notifyCallback(
-    BLERemoteCharacteristic *pBLERemoteCharacteristic,
-    uint8_t *pData,
-    size_t length,
-    bool isNotify)
+static void notifyCallback(BLEClientCharacteristic *chr, uint8_t *data, uint16_t length)
 {
-  // どちらのペリフェラルからのNotifyかをCharacteristic UUIDで判別する
+  // どちらのペリフェラルからのNotifyかをキャラクタリスティックのポインタで判別する
   int idx = -1;
   for (int i = 0; i < PERIPH_COUNT; i++)
   {
-    if (pBLERemoteCharacteristic->getUUID().equals(peripherals[i].notifyCharUUID))
+    if (chr == &peripherals[i].notifyCharac)
     {
       idx = i;
       break;
@@ -235,17 +162,17 @@ static void notifyCallback(
   }
   String &rxBuffer = peripherals[idx].rxBuffer;
 
-  digitalWrite(BLUE_LED_PIN, HIGH); // 本体LED点灯
+  digitalWrite(BLUE_LED_PIN, LED_STATE_ON);  // 本体LED点灯
   ledOnTime = millis();  // LED点灯開始時刻を記録
   Serial.print("Notify callback for characteristic ");
-  Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
+  Serial.print(chr->uuid.toString());
   Serial.print(" of data length ");
   Serial.println(length);
 
   // 受信データをバッファに追加
   for (size_t i = 0; i < length; i++)
   {
-    char c = (char)pData[i];
+    char c = (char)data[i];
 
     if (c == '\n')
     {
@@ -302,273 +229,262 @@ static void notifyCallback(
   }
 }
 
-// M5Stack Basic（I2Cマスター）からのコマンド書き込み受信完了時にISRコンテキストで呼ばれる。
-// この時点でコマンドに対応する応答フレームをタスクに用意させる（読み取り開始を待ってからでは遅い）
-static bool onI2CReceiveDone(i2c_slave_dev_handle_t handle,
-                              const i2c_slave_rx_done_event_data_t *evt, void *arg)
+// サービス・キャラクタリスティックを探索しNotify購読を行う。接続確立後にconnectCallbackから呼ばれる
+static bool discoverAndSubscribe(PeripheralContext &p, uint16_t conn_handle)
 {
-  lastCommand = evt->buffer[0];
-  BaseType_t hpw = pdFALSE;
-  vTaskNotifyGiveFromISR(i2cSlaveTaskHandle, &hpw);
-  return hpw == pdTRUE;
-}
-
-// クロックストレッチ発生時にISRコンテキストで呼ばれる（現在はflags.stretch_en=0のため通常は
-// 発火しない。診断用に残してあるだけで、カウントが増えていれば何らかの理由でストレッチが
-// 発生していることが分かる。ドライバはこのコールバックが返った直後に無条件でストレッチを
-// 解除するため、ここでは応答データを用意できない（Serial出力もISRからは非安全なため行わない）
-static bool onI2CStretch(i2c_slave_dev_handle_t handle,
-                          const i2c_slave_stretch_event_data_t *evt, void *arg)
-{
-  i2cStretchEventCount = i2cStretchEventCount + 1;  // volatileへの++はC++20で非推奨のため加算代入で書く
-  return false;
-}
-
-// I2Cスレーブデバイスを(再)初期化する。i2cSlaveConfigは事前に設定済みであること
-static bool initI2CSlaveDevice()
-{
-  esp_err_t err = i2c_new_slave_device(&i2cSlaveConfig, &i2cSlaveHandle);
-  if (err != ESP_OK)
+  if (!p.service.discover(conn_handle))
   {
-    Serial.printf("[I2C] i2c_new_slave_device failed: %s\n", esp_err_to_name(err));
-    return false;
-  }
-
-  i2c_slave_event_callbacks_t i2cCallbacks = {};
-  i2cCallbacks.on_recv_done = onI2CReceiveDone;
-  i2cCallbacks.on_stretch_occur = onI2CStretch;
-  err = i2c_slave_register_event_callbacks(i2cSlaveHandle, &i2cCallbacks, nullptr);
-  if (err != ESP_OK)
-  {
-    Serial.printf("[I2C] i2c_slave_register_event_callbacks failed: %s\n", esp_err_to_name(err));
-    return false;
-  }
-
-  i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));  // 受信をアーム
-  return true;
-}
-
-// 直近のデバイス再作成から最低これだけ間隔を空ける(ミリ秒)
-static const unsigned long I2C_RESET_COOLDOWN_MS = 50;
-static unsigned long lastI2CResetMillis = 0;
-
-// TXリングバッファが詰まる等でi2c_slave_transmit()が失敗し続ける場合の自己修復。
-// デバイスを作り直すことで未消費のリングバッファ内容を強制的に破棄する
-// (タスクコンテキストから呼ぶこと。ISRからは呼べない)
-static void resetI2CSlaveDevice()
-{
-  unsigned long now = millis();
-  if (i2cSlaveHandle && (now - lastI2CResetMillis) < I2C_RESET_COOLDOWN_MS)
-  {
-    // i2c_del_slave_device+i2c_new_slave_deviceはGPIOのI2Cペリフェラルへの
-    // 再アタッチを伴い、それ自体がSDA/SCL上に瞬間的なグリッチを生んで
-    // さらなる誤検出を誘発している可能性がある。短時間に連続で発生した場合は
-    // デバイスの作り直しまでは行わず、受信の再アームのみで様子を見る
-    Serial.println("[I2C] transmit stuck, but skipping full reset (cooldown)");
-    i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));
-    return;
-  }
-
-  Serial.println("[I2C] resetting slave device (transmit stuck)");
-  lastI2CResetMillis = now;
-  if (i2cSlaveHandle)
-  {
-    i2c_del_slave_device(i2cSlaveHandle);
-    i2cSlaveHandle = nullptr;
-  }
-  if (!initI2CSlaveDevice())
-  {
-    // 再初期化に失敗してもクラッシュさせない(BLE接続は維持する)。
-    // 次のコマンド受信で再度失敗が続く場合はログで分かる
-    Serial.println("[I2C] slave device re-init failed");
-  }
-}
-
-// コマンド受信のたびにタスクコンテキストで呼ばれ、応答フレームをTXリングバッファに積んでおく
-// （ISR内でi2c_slave_transmit/receiveを呼ばないための橋渡し）
-static void i2cSlaveTask(void *arg)
-{
-  static uint8_t emptyFrame[I2C_FRAME_SIZE] = {0};
-  // 送信用の一時バッファ。共有のフレーム配列(engineTempFrame等)を直接書き換えず、
-  // ここにコピーしてからコマンドエコーを埋め込む(BLE Notifyコールバック側からの
-  // 書き込みと競合させないため)
-  static uint8_t txBuffer[I2C_FRAME_SIZE];
-  for (;;)
-  {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-    uint8_t *frame = emptyFrame;  // 未知のコマンドは長さ0の空フレームを返す
-    uint8_t cmd = lastCommand;
-    switch (cmd)
-    {
-    case CMD_ENGINE_TEMP:
-      frame = engineTempFrame;
-      break;
-    case CMD_PRI_PRE:
-      frame = priPreFrame;
-      break;
-    case CMD_SEC_PRE:
-      frame = secPreFrame;
-      break;
-    case CMD_FUEL_PRE:
-      frame = fuelPreFrame;
-      break;
-    }
-
-    // 何らかの理由（バスノイズ等）でマスター側が受け取った応答が要求と異なる
-    // コマンドの分だった場合にマスター側で検知・リトライできるよう、フレーム末尾
-    // 1byteに要求されたコマンドをそのままエコーバックする
-    memcpy(txBuffer, frame, I2C_FRAME_SIZE);
-    txBuffer[I2C_FRAME_SIZE - 1] = cmd;
-
-    // タイムアウトは短めにする。詰まっている場合はここで長時間ブロックせず
-    // 素早く検知してresetI2CSlaveDevice()に切り替えるため
-    esp_err_t err = i2c_slave_transmit(i2cSlaveHandle, txBuffer, I2C_FRAME_SIZE, 5);
-    // 診断用ログ（動作確認できたら削除/コメントアウトして問題ない）
-    Serial.printf("[I2C] cmd=0x%02X transmit=%s stretch_total=%lu\n",
-                  cmd, (err == ESP_OK) ? "OK" : esp_err_to_name(err),
-                  (unsigned long)i2cStretchEventCount);
-
-    if (err == ESP_OK)
-    {
-      // 次のコマンドバイト受信に備えて再アーム
-      i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));
-    }
-    else
-    {
-      // リングバッファ詰まり等、通常の再アームでは復旧しないため
-      // デバイスごと作り直して未消費データを破棄する(受信の再アームも兼ねる)
-      resetI2CSlaveDevice();
-    }
-  }
-}
-
-void scan()
-{
-  // 5秒間のブロッキングスキャン。結果は使い切ったら不要なのでクリアする(is_continue=false)。
-  // 未発見のペリフェラルが残っている限りloop()から繰り返し呼ばれる
-  pBLEScan->start(SCAN_DURATION_SEC, false);
-}
-
-bool connect(int idx)
-{
-  PeripheralContext &p = peripherals[idx];
-
-  BLEClient *pClient = BLEDevice::createClient();
-  pClient->setClientCallbacks(new MyClientCallbacks(idx));
-  if (!pClient->connect(p.pPeripheral))
-  {
-    return false;
-  }
-
-  BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
-  if (pRemoteService == nullptr)
-  {
-    Serial.printf("[%s] Failed to find our service UUID: %s\n", p.name, serviceUUID.toString().c_str());
-    pClient->disconnect();
+    Serial.printf("[%s] Failed to find our service UUID: %s\n", p.name, SERVICE_UUID);
     return false;
   }
   Serial.printf("[%s] - Found our service\n", p.name);
 
-  // Writeで使うためにCharacteristicを保持しておく
-  p.pRemoteCharacteristic = pRemoteService->getCharacteristic(p.charUUID);
-  if (p.pRemoteCharacteristic == nullptr)
+  if (!p.charac.discover())
   {
-    Serial.printf("[%s] Failed to find our characteristic UUID: %s\n", p.name, p.charUUID.toString().c_str());
-    pClient->disconnect();
+    Serial.printf("[%s] Failed to find our characteristic UUID\n", p.name);
     return false;
   }
   Serial.printf("[%s] - Found our characteristic\n", p.name);
 
-  if (p.pRemoteCharacteristic->canRead())
+  if (!p.notifyCharac.discover())
   {
-    String value = p.pRemoteCharacteristic->readValue();
-    Serial.printf("[%s] The characteristic value was: %s\n", p.name, value.c_str());
-  }
-
-  if (!p.pRemoteCharacteristic->canWrite())
-  {
-    Serial.printf("[%s] Characteristic is not writable\n", p.name);
-    pClient->disconnect();
+    Serial.printf("[%s] Failed to find our notify characteristic UUID\n", p.name);
     return false;
   }
 
-  p.pNotifyCharacteristic = pRemoteService->getCharacteristic(p.notifyCharUUID);
-  if (p.pNotifyCharacteristic == nullptr)
-  {
-    Serial.printf("[%s] Failed to find our notify characteristic UUID: %s\n", p.name, p.notifyCharUUID.toString().c_str());
-    pClient->disconnect();
-    return false;
-  }
-
-  if (p.pNotifyCharacteristic->canNotify())
-  {
-    p.pNotifyCharacteristic->registerForNotify(notifyCallback);
-    Serial.printf("[%s] - Registered for notify\n", p.name);
-  }
-
+  p.notifyCharac.enableNotify();
+  Serial.printf("[%s] - Registered for notify\n", p.name);
   return true;
+}
+
+// 接続確立時に呼ばれる。Service UUIDが共通なため、接続先の判別はここでピア名から行う
+static void connectCallback(uint16_t conn_handle)
+{
+  char nameBuf[32] = {0};
+  Bluefruit.Connection(conn_handle)->getPeerName(nameBuf, sizeof(nameBuf) - 1);
+
+  int idx = findPeripheralByName(nameBuf);
+  if (idx < 0)
+  {
+    // 想定外のデバイスが接続した（スキャン段階でService UUID+名前を絞り込んでいるため
+    // 基本的に発生しないが、念のため切断する）
+    Serial.printf("Unexpected device connected (%s), disconnecting\n", nameBuf);
+    Bluefruit.disconnect(conn_handle);
+    return;
+  }
+
+  PeripheralContext &p = peripherals[idx];
+  p.connHandle = conn_handle;
+
+  if (discoverAndSubscribe(p, conn_handle))
+  {
+    p.state = STATE_CONNECTED;
+    Serial.printf("Connected to server (%s)\n", p.name);
+  }
+  else
+  {
+    Serial.printf("Failed to connect (%s)\n", p.name);
+    Bluefruit.disconnect(conn_handle);
+    resetPeripheral(idx);
+  }
+
+  // 未接続のペリフェラルが残っていればスキャンを継続する
+  // (Central.connect()呼び出し後スキャナーは一時停止しているため、明示的な再開が必要)
+  if (needsScan())
+  {
+    Bluefruit.Scanner.start(0);
+  }
+}
+
+// 切断時に呼ばれる。切断されたペリフェラルのみ状態をリセットする
+// (Bluefruit.Scanner.restartOnDisconnect(true)によりスキャンは自動的に再開される)
+static void disconnectCallback(uint16_t conn_handle, uint8_t reason)
+{
+  for (int i = 0; i < PERIPH_COUNT; i++)
+  {
+    if (peripherals[i].connHandle == conn_handle)
+    {
+      Serial.printf("onDisconnect (%s), reason = 0x%02X\n", peripherals[i].name, reason);
+      resetPeripheral(i);  // 再スキャンで再発見できるようにする
+      break;
+    }
+  }
+}
+
+// スキャン結果を受信するたびに呼ばれる。SoftDevice仕様上、レポート受信のたびに
+// スキャナーは一時停止するため、接続を試みない場合は明示的にresume()する必要がある
+static void scanCallback(ble_gap_evt_adv_report_t *report)
+{
+  // Service UUIDはHeater/AutoAirAdjust共通のため、アドバタイズ名(Complete Local Name)で
+  // 判別する。名前はScan Response側に含まれるため、この判定にはアクティブスキャンが必須
+  uint8_t nameBuf[32] = {0};
+  uint8_t nameLen = Bluefruit.Scanner.parseReportByType(
+      report, BLE_GAP_AD_TYPE_COMPLETE_LOCAL_NAME, nameBuf, sizeof(nameBuf));
+
+  if (nameLen > 0)
+  {
+    int idx = findPeripheralByName((const char *)nameBuf);
+    if (idx >= 0 && peripherals[idx].state == STATE_IDLE)
+    {
+      Serial.printf("Device found! (%s)\n", peripherals[idx].name);
+      peripherals[idx].state = STATE_DO_CONNECT;
+      Bluefruit.Central.connect(report);  // 結果はconnectCallback/disconnectCallbackへ通知される
+      return;  // connect()呼び出し後はスキャナーが一時停止するのでresume()は不要
+    }
+  }
+
+  // 対象デバイスでない場合はスキャンを再開する
+  Bluefruit.Scanner.resume();
+}
+
+// I2Cスレーブの応答フレーム。マスターがコマンドを書き込んだ時点(receiveEvent)で確定させ、
+// 読み取り要求時(requestEvent)にはそのまま返すだけにする
+static uint8_t txFrameBuffer[I2C_FRAME_SIZE];
+static const uint8_t emptyFrame[I2C_FRAME_SIZE] = {0};
+
+static const uint8_t *frameForCommand(uint8_t cmd)
+{
+  switch (cmd)
+  {
+  case CMD_ENGINE_TEMP:
+    return engineTempFrame;
+  case CMD_PRI_PRE:
+    return priPreFrame;
+  case CMD_SEC_PRE:
+    return secPreFrame;
+  case CMD_FUEL_PRE:
+    return fuelPreFrame;
+  default:
+    return emptyFrame;  // 未定義コマンドは長さ0の空フレームを返す
+  }
+}
+
+// M5Stack Basic（I2Cマスター）からのコマンド書き込み完了時に呼ばれる。
+// nRF52のWireライブラリはonReceive/onRequestを真の割り込みコンテキストから直接呼ぶため、
+// ここでは応答フレームの確定のみを行い、重い処理やSerial出力は避ける
+static void receiveEvent(int numBytes)
+{
+  if (numBytes < 1)
+  {
+    return;
+  }
+  uint8_t cmd = Wire.read();
+  while (Wire.available())
+  {
+    Wire.read();  // 想定外の余剰バイトは読み捨て
+  }
+
+  memcpy(txFrameBuffer, frameForCommand(cmd), I2C_FRAME_SIZE);
+  // 末尾1byteに要求されたコマンドをエコーバックし、マスター側でズレを検知できるようにする
+  txFrameBuffer[I2C_FRAME_SIZE - 1] = cmd;
+}
+
+// マスターの読み取り要求時に呼ばれる。nRF52のTWIS(スレーブ)ペリフェラルは、
+// ソフトウェアがこのコールバックからTXバッファを準備し終えるまでハードウェアが
+// 自動的にクロックストレッチを維持するため、ESP32-C6版で必要だった「間に合わない」
+// 対策(タスク経由での事前送信・クロックストレッチ無効化・自己修復等)は不要になった
+static void requestEvent()
+{
+  Wire.write(txFrameBuffer, I2C_FRAME_SIZE);
 }
 
 void setup()
 {
-  Serial.begin(115200);
-
-  pinMode(BLUE_LED_PIN, OUTPUT); // 本体LED青
-
-  digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
-
-  // I2Cスレーブとして初期化し、M5Stack Basicからの要求に応答する
-  // (ESP32-C6ではArduino Wireのスレーブ読み取り要求(onRequest)が発火しないため、
-  //  driver/i2c_slave.hを直接使用する)
-  // タスクはコールバック登録より前に生成する(ISRからvTaskNotifyGiveFromISRで直接参照するため)。
-  // 優先度は高め(20)にして、コマンド受信からTX準備完了までをできるだけ短くする
-  // (マスター側は書き込み直後にすぐ読み取りを行うため、応答準備の遅れがそのまま失敗に直結する)
-  xTaskCreate(i2cSlaveTask, "i2c_slave_task", 4096, nullptr, 20, &i2cSlaveTaskHandle);
-
-  // i2cSlaveConfigはファイルスコープの変数(74行目付近)。resetI2CSlaveDevice()での
-  // 再初期化時にも同じ設定を使い回すため、ここではローカル変数として再宣言しない
-  i2cSlaveConfig.i2c_port = -1;  // 自動選択
-  i2cSlaveConfig.sda_io_num = (gpio_num_t)I2C_SDA_PIN;
-  i2cSlaveConfig.scl_io_num = (gpio_num_t)I2C_SCL_PIN;
-  i2cSlaveConfig.clk_source = I2C_CLK_SRC_DEFAULT;
-  // 未読了のフレームが溜まった場合の保険として、I2C_FRAME_SIZE(32)の8フレーム分を確保。
-  // 突発的な多重コマンド受信があってもリセット(自体がバス上のグリッチを誘発しうる)に
-  // 頼らず吸収できる余地を増やす (2→4→8フレーム分と段階的に拡大)
-  i2cSlaveConfig.send_buf_depth = 256;
-  i2cSlaveConfig.slave_addr = I2C_SLAVE_ADDR;
-  i2cSlaveConfig.addr_bit_len = I2C_ADDR_BIT_LEN_7;
-  i2cSlaveConfig.intr_priority = 3;  // BLEスキャン処理との競合による割り込み遅延を減らすため明示的に高めに設定
-  // クロックストレッチは無効化する。BLEスキャン等でCPUが混雑している状況では
-  // ストレッチの解除(ISR処理)自体が遅延し、マスター側からはSCLが長時間(観測上約1秒)
-  // Low に張り付いたように見え、Wire.setTimeOut()では救えないバス全体のスタックを
-  // 引き起こしていた。応答フレームはコマンド受信完了(onI2CReceiveDone)の時点で
-  // 事前に用意しているため、ストレッチが無くても通常は間に合う。万一間に合わなくても
-  // 「ストレッチ無し」なら単に空/古いフレームが返るだけで、バスは長時間ブロックしない
-  i2cSlaveConfig.flags.stretch_en = 0;
-
-  // 初期化本体はinitI2CSlaveDevice()に切り出してあり、実行時の自己修復
-  // (resetI2CSlaveDevice())からも同じ関数を呼び出す。起動時に失敗する場合は
-  // 配線・アドレス設定等の致命的な問題である可能性が高いため、従来通り停止する
-  if (!initI2CSlaveDevice())
+  // Serial/BLE初期化より前の、最速の起動チェックポイント。ここでLED_REDが3回点滅しなければ
+  // Arduino setup()にすら到達できていない(電源/書き込み自体の問題)と切り分けられる。
+  // LED_BLUEはBluefruitがスキャン中/接続中の状態表示に自動で使う(後述)ため、
+  // この起動チェックには使わずLED_REDを使う
+  pinMode(LED_RED, OUTPUT);
+  for (int i = 0; i < 3; i++)
   {
-    Serial.println("[I2C] initial slave device init failed, halting");
-    abort();
+    digitalWrite(LED_RED, LED_STATE_ON);
+    delay(100);
+    digitalWrite(LED_RED, !LED_STATE_ON);
+    delay(100);
   }
 
-  BLEDevice::init("M5NanoC6 BLE Client");
+  Serial.begin(115200);
+  // ネイティブUSB CDCは接続確立に時間がかかるため少し待つが、シリアル未接続でも
+  // 本体は単体で動作し続ける必要があるためタイムアウト付きにする
+  uint32_t serialWaitStart = millis();
+  while (!Serial && (millis() - serialWaitStart) < 3000)
+  {
+    delay(10);
+  }
 
-  pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  // Interval, Windowはdefaultの値で動作して問題なさそうなため設定しない。
+  // 起動確認用バナー。BLEペリフェラル未発見・I2C要求未受信の間はこれ以降何もログが
+  // 出ないため(scanCallback/receiveEvent/requestEventは対象デバイス発見時/通信時のみ
+  // 出力する設計)、これが表示されればボード自体は正常に起動していると判断できる
+  Serial.println("XiaoNRF52840 BLE Central starting...");
+  Serial.printf("I2C slave addr=0x%02X (SDA=D4, SCL=D5)\n", I2C_SLAVE_ADDR);
+  Serial.printf("Target peripherals: %s / %s\n", HEATER_DEVICE_NAME, AUTOAIR_DEVICE_NAME);
+
+  pinMode(BLUE_LED_PIN, OUTPUT);
+  digitalWrite(BLUE_LED_PIN, !LED_STATE_ON);  // 本体LED消灯
+
+  // I2Cスレーブとして初期化し、M5Stack Basicからの要求に応答する
+  // (nRF52840はI2Cマスター(TWIM)とスレーブ(TWIS)が別ペリフェラルのため、標準Wireの
+  //  スレーブモードがそのまま使える。ESP32-C6版のESP-IDFネイティブAPI直接呼び出しは不要)
+  Wire.begin(I2C_SLAVE_ADDR);
+  Wire.onReceive(receiveEvent);
+  Wire.onRequest(requestEvent);
+
+  // ここに到達したかを切り分けるための中間チェックポイント(中くらいの速さで1回点滅)。
+  // これが見えた後、何の反応もなくなる(以降のチェックポイントも出ない)場合は
+  // Bluefruit.begin()内部でのハードフォルト(SoftDeviceの有効化失敗等)が疑われる
+  digitalWrite(LED_RED, LED_STATE_ON);
+  delay(200);
+  digitalWrite(LED_RED, !LED_STATE_ON);
+  delay(200);
+
+  // BLE Central初期化 (Peripheralロールは使わないため0、Central接続はPERIPH_COUNT台分確保)。
+  // 失敗する場合はSoftDevice用RAM不足等の致命的な問題である可能性が高いため、
+  // ESP32-C6版のI2C初期化失敗時と同様に停止する。
+  // (ここで戻ってこられる「きれいな失敗」と、begin()内部でのハードフォルトによる無反応を
+  //  見分けられるよう、上のチェックポイントとは明確に異なる遅い点滅にし、Serial出力も
+  //  接続タイミングを問わず捕捉できるよう繰り返す)
+  if (!Bluefruit.begin(0, PERIPH_COUNT))
+  {
+    while (true)
+    {
+      Serial.println("FATAL: Bluefruit.begin() failed");
+      digitalWrite(LED_RED, LED_STATE_ON);
+      delay(1000);
+      digitalWrite(LED_RED, !LED_STATE_ON);
+      delay(1000);
+    }
+  }
+  Bluefruit.setName("XiaoNRF52840 BLE Client");
+  // BluefruitはデフォルトでLED_BLUEをスキャン中/接続中の状態表示に自動使用するが、
+  // 本プロジェクトではLED_BLUE(BLUE_LED_PIN)をNotify受信インジケータとして使うため、
+  // Bluefruit側の自動制御は無効化して競合を避ける
+  Bluefruit.autoConnLed(false);
+
+  // 各ペリフェラルのサービス・キャラクタリスティックをBluefruitへ登録する
+  // (実際のGATTハンドル探索(discover)は接続確立後にconnectCallbackで行う)
+  for (int i = 0; i < PERIPH_COUNT; i++)
+  {
+    PeripheralContext &p = peripherals[i];
+    p.service.begin();
+    p.charac.begin(&p.service);
+    p.notifyCharac.setNotifyCallback(notifyCallback);
+    p.notifyCharac.begin(&p.service);
+  }
+
+  Bluefruit.Central.setConnectCallback(connectCallback);
+  Bluefruit.Central.setDisconnectCallback(disconnectCallback);
+
+  // Interval/Windowはdefaultの値で動作して問題なさそうなため設定しない。
   // Heater/AutoAirAdjustいずれもデバイス名が128bit Service UUIDと合わせるとレガシー広告パケットに
   // 収まらないため、名前はScan Responseに回される。名前でのペリフェラル判別にはScan Responseの
   // 取得が必須のため、アクティブスキャンにする(パッシブでは名前が空になり判別できない)
-  // https://github.com/espressif/arduino-esp32/blob/master/libraries/BLE/examples/BLE_scan/BLE_scan.ino#L27
-  pBLEScan->setActiveScan(true);
+  Bluefruit.Scanner.setRxCallback(scanCallback);
+  Bluefruit.Scanner.restartOnDisconnect(true);  // 切断時に自動で再スキャンを開始する
+  Bluefruit.Scanner.filterUuid(serviceUuid);
+  Bluefruit.Scanner.useActiveScan(true);
+  Bluefruit.Scanner.start(0);  // 0 = タイムアウトなしで継続スキャン
 
-  // setup時点で1回スキャンを実行。以降は未発見のペリフェラルが残っていればloop()で継続する
-  scan();
+  Serial.println("Scanning...");
 }
 
 void loop()
@@ -576,32 +492,10 @@ void loop()
   // LED点灯時間後に自動消灯
   if (ledOnTime > 0 && (millis() - ledOnTime) >= LED_ON_DURATION)
   {
-    digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
+    digitalWrite(BLUE_LED_PIN, !LED_STATE_ON);  // 本体LED消灯
     ledOnTime = 0;
   }
 
-  // Heater/AutoAirAdjust それぞれ独立に接続処理を進める（片方が失敗してももう片方は継続動作する）
-  for (int i = 0; i < PERIPH_COUNT; i++)
-  {
-    if (peripherals[i].state != STATE_DO_CONNECT)
-    {
-      continue;
-    }
-    if (connect(i))
-    {
-      Serial.printf("Connected to server (%s)\n", peripherals[i].name);
-    }
-    else
-    {
-      Serial.printf("Failed to connect (%s)\n", peripherals[i].name);
-      resetPeripheral(i);  // 次のscan()で再発見・再接続を試みられるようにする
-    }
-  }
-
-  // 未発見のペリフェラルが残っていればスキャンを継続する
-  // (両方接続済みならscan()を呼ばずCPUを消費しない。切断されると該当エントリがIDLEに戻り自動的に再開する)
-  if (needsScan())
-  {
-    scan();
-  }
+  // BLE(スキャン/接続/Notify)・I2Cスレーブ応答は全てコールバック駆動のため、
+  // loop()側で行う処理はLED自動消灯のみ
 }
