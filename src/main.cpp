@@ -443,6 +443,7 @@ void setup()
   i2cSlaveConfig.send_buf_depth = 64;  // I2C_FRAME_SIZE(32)以上を確保
   i2cSlaveConfig.slave_addr = I2C_SLAVE_ADDR;
   i2cSlaveConfig.addr_bit_len = I2C_ADDR_BIT_LEN_7;
+  i2cSlaveConfig.intr_priority = 3;  // BLEスキャン処理との競合による割り込み遅延を減らすため明示的に高めに設定
   // クロックストレッチは無効化する。BLEスキャン等でCPUが混雑している状況では
   // ストレッチの解除(ISR処理)自体が遅延し、マスター側からはSCLが長時間(観測上約1秒)
   // Low に張り付いたように見え、Wire.setTimeOut()では救えないバス全体のスタックを
