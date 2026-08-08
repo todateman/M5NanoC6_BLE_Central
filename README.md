@@ -9,7 +9,7 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
 - Arduino フレームワーク (esp32-arduino)
 - BLE Central: Heater / AutoAirAdjust 2台の BLE ペリフェラルに**同時接続**（Service UUID は共通のため、アドバタイズ名で判別）→ Notify 購読
 - Notify 受信で LED(青) 点灯し、受信データを32バイト固定フレームに格納して保持
-- Grove ポートを I2C スレーブ化 (アドレス 0x08、コマンドで要求データの種類を指定して応答)
+- Grove ポートを I2C スレーブ化 (アドレス 0x08、コマンドで要求データの種類を指定して応答。ESP-IDF ネイティブの `driver/i2c_slave.h` を直接使用、詳細は後述)
 - PlatformIO プロジェクト構成 (複数 env 拡張可能)
 - Arduino フレームワーク (esp32-arduino)
 - USB CDC 有効化設定済み (高速アップロード 1.5Mbps 設定)
@@ -109,6 +109,17 @@ AutoAirAdjust 側の BLE 送信機能は [feature/BLE ブランチ, commit 5b8b8
   - BLE Notify 未受信時（起動直後など）は全ゼロを返す
 - 動作: マスターがコマンドを書き込んだ後 `Wire.requestFrom()` で読み出すと、直近に BLE で受信した最新データを返す（新しい Notify を受信するまで同じ値を返し続ける）
 
+### スレーブ側の実装メモ（ESP32-C6 の I2C 制限と対応）
+
+M5NanoC6 (ESP32-C6) 側は Arduino の `Wire` ライブラリのスレーブ機能ではなく、ESP-IDF ネイティブの `driver/i2c_slave.h` を直接使用しています。
+
+- **なぜ `Wire` のスレーブ機能を使っていないか**: arduino-esp32 の I2C スレーブ HAL 実装 (`esp32-hal-i2c-slave.c`) は、マスターの読み取り要求を検出するために使う SCL クロックストレッチ原因の判定が ESP32-C3 / S3 専用の分岐になっており、ESP32-C6 では常に `I2C_STRETCH_CAUSE_MAX` を返す。そのため `Wire.onRequest()` が構造的に一度も発火しない（arduino-esp32 側の既知の制限）。`Wire.onReceive()`（マスターからのコマンド書き込み受信）は別経路で動作するため問題なく、結果として「コマンド送信は通るが、データの読み出し応答だけが必ず失敗する」という症状になる
+- **対応**: ESP-IDF ネイティブの `driver/i2c_slave.h`（V1 ドライバ。プリコンパイル済みライブラリの構成上 `on_request` コールバックを持つ V2 版 API はリンクできないため使用不可）を直接使用する
+  - `i2c_new_slave_device()` でスレーブを初期化し、`flags.stretch_en = 1` でクロックストレッチを有効化
+  - マスターの読み取り開始は `on_stretch_occur` コールバック（`I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH`）で検知する（`Wire.onRequest()` 相当）
+  - ISR コンテキストでは重い処理をせず、キュー (`i2cEventQueue`) 経由でタスク (`i2cSlaveTask`) に処理を委譲し、そこから `i2c_slave_transmit()` で応答フレームを送信する
+  - マスター側（M5Stack Basic, [Chibi-T_Furoshiki_Logger](https://github.com/todateman/Chibi-T_Furoshiki_Logger)）のプロトコル・実装（`Wire.requestFrom()` を使う一般的な I2C マスター実装）には変更は不要
+
 ### M5Stack Basic（マスター）側のサンプルコード
 
 ```cpp
@@ -206,7 +217,7 @@ Notify callback for characteristic ... of data length N
 - I2Cスレーブアドレス: `#define I2C_SLAVE_ADDR 0x08` で変更可
 - I2Cピン: `#define I2C_SDA_PIN 2`, `#define I2C_SCL_PIN 1` (Grove ポート)
 - フレームサイズ: `#define I2C_FRAME_SIZE 32` で変更可（データ本体は `I2C_FRAME_SIZE - 1` バイトまで）
-- コマンド: `CMD_ENGINE_TEMP` / `CMD_PRI_PRE` / `CMD_SEC_PRE` / `CMD_FUEL_PRE` を定義済み。さらに他のデータを中継する場合は新しいコマンド定数とフレーム/ハンドリング（および必要ならタグ文字列）を追加
+- コマンド: `CMD_ENGINE_TEMP` / `CMD_PRI_PRE` / `CMD_SEC_PRE` / `CMD_FUEL_PRE` を定義済み。さらに他のデータを中継する場合は新しいコマンド定数とフレーム/ハンドリング（および必要ならタグ文字列）を追加。応答フレームの選択ロジックは `onRequest` コールバックではなく `i2cSlaveTask` 内の `switch (lastCommand)` に実装されている点に注意
 - LED ピン: `#define BLUE_LED_PIN 7`
 - UUID: `SERVICE_UUID`（共通）/ `HEATER_CHARACTERISTIC_UUID` / `HEATER_NOTIFY_CHARACTERISTIC_UUID` / `AUTOAIR_CHARACTERISTIC_UUID` / `AUTOAIR_NOTIFY_CHARACTERISTIC_UUID` で差し替え可能
 - デバイス名フィルタ: `HEATER_DEVICE_NAME` / `AUTOAIR_DEVICE_NAME`（接続先の判別に使用、Service UUID が共通のため必須）
@@ -223,10 +234,11 @@ Notify callback for characteristic ... of data length N
 - データ検証 (CRC / バージョン / シーケンス番号)
 - LED 点灯時間制御 (非同期タイマ) および点滅パターンで状態表示
 - 状態遷移図とエラーハンドリング整備
+- I2C クロックストレッチのタイミングに関する実機での長時間動作検証（断続的な読み取り要求失敗が出ないかの確認）
 
 ## ライセンス
 
 本ソフトウェアは MIT License です。`LICENSE` を参照してください。
 
 ---
-ドキュメント最終更新: 2026-07-25 (Heater/AutoAirAdjust 同時接続対応)
+ドキュメント最終更新: 2026-08-08 (ESP32-C6 の I2C スレーブ実装を Arduino Wire から ESP-IDF ネイティブドライバ (`driver/i2c_slave.h`) に変更)

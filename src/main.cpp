@@ -5,7 +5,7 @@
 
 #include <Arduino.h>
 #include <BLEDevice.h>
-#include <Wire.h>
+#include "driver/i2c_slave.h"
 
 // Grove Port -> I2C (M5Stack Basicをマスターとするスレーブとして動作)
 #define I2C_SCL_PIN 1
@@ -53,8 +53,17 @@ static uint8_t priPreFrame[I2C_FRAME_SIZE] = {0};
 static uint8_t secPreFrame[I2C_FRAME_SIZE] = {0};
 static uint8_t fuelPreFrame[I2C_FRAME_SIZE] = {0};
 
-// マスターが直前に書き込んできたコマンド（onReceiveで更新し、onRequestで参照する）
-static uint8_t lastCommand = 0x00;
+// マスターが直前に書き込んできたコマンド（受信コールバックで更新し、送信処理で参照する）
+static volatile uint8_t lastCommand = 0x00;
+
+// ESP-IDFネイティブI2Cスレーブドライバ関連
+// (ESP32-C6はarduino-esp32のWireライブラリのスレーブ読み取り要求(onRequest)が
+//  構造的に発火しない既知の制限があるため、Wireを使わずdriver/i2c_slave.hを直接使う)
+static i2c_slave_dev_handle_t i2cSlaveHandle = nullptr;
+static QueueHandle_t i2cEventQueue = nullptr;
+static uint8_t i2cCmdBuffer[1];  // 受信コマンドバイト用バッファ
+
+enum { I2C_EVT_RX, I2C_EVT_TX };
 
 #define STATE_IDLE 0
 #define STATE_DO_CONNECT 1
@@ -278,44 +287,67 @@ static void notifyCallback(
   }
 }
 
-// M5Stack Basic（I2Cマスター）からのコマンド書き込み受信時に呼ばれる
-void onI2CReceive(int numBytes)
+// M5Stack Basic（I2Cマスター）からのコマンド書き込み受信完了時にISRコンテキストで呼ばれる
+static bool onI2CReceiveDone(i2c_slave_dev_handle_t handle,
+                              const i2c_slave_rx_done_event_data_t *evt, void *arg)
 {
-  if (numBytes > 0)
-  {
-    lastCommand = Wire.read();
-  }
-  // 想定外の追加バイトは読み捨てる
-  while (Wire.available())
-  {
-    Wire.read();
-  }
+  lastCommand = evt->buffer[0];
+  uint8_t e = I2C_EVT_RX;
+  BaseType_t hpw = pdFALSE;
+  xQueueSendFromISR(i2cEventQueue, &e, &hpw);
+  return hpw == pdTRUE;
 }
 
-// M5Stack Basic（I2Cマスター）からの読み出し要求時に呼ばれる
-void onI2CRequest()
+// M5Stack Basic（I2Cマスター）の読み出し要求でSCLがストレッチされた瞬間にISRコンテキストで呼ばれる
+// (Wire.onRequest相当。ESP32-C6ではクロックストレッチ通知が読み取り要求検出の代替手段になる)
+static bool onI2CStretch(i2c_slave_dev_handle_t handle,
+                          const i2c_slave_stretch_event_data_t *evt, void *arg)
 {
-  switch (lastCommand)
+  if (evt->stretch_cause == I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH)
   {
-  case CMD_ENGINE_TEMP:
-    Wire.write(engineTempFrame, I2C_FRAME_SIZE);
-    break;
-  case CMD_PRI_PRE:
-    Wire.write(priPreFrame, I2C_FRAME_SIZE);
-    break;
-  case CMD_SEC_PRE:
-    Wire.write(secPreFrame, I2C_FRAME_SIZE);
-    break;
-  case CMD_FUEL_PRE:
-    Wire.write(fuelPreFrame, I2C_FRAME_SIZE);
-    break;
-  default:
-  {
-    // 未知のコマンド: 長さ0の空フレームを返す
-    uint8_t emptyFrame[I2C_FRAME_SIZE] = {0};
-    Wire.write(emptyFrame, I2C_FRAME_SIZE);
-    break;
+    uint8_t e = I2C_EVT_TX;
+    BaseType_t hpw = pdFALSE;
+    xQueueSendFromISR(i2cEventQueue, &e, &hpw);
+    return hpw == pdTRUE;
   }
+  return false;
+}
+
+// I2Cイベントをタスクコンテキストで処理する（ISR内でi2c_slave_transmit/receiveを呼ばないための橋渡し）
+static void i2cSlaveTask(void *arg)
+{
+  static uint8_t emptyFrame[I2C_FRAME_SIZE] = {0};
+  uint8_t evt;
+  for (;;)
+  {
+    if (xQueueReceive(i2cEventQueue, &evt, portMAX_DELAY) == pdTRUE)
+    {
+      if (evt == I2C_EVT_RX)
+      {
+        // 次のコマンドバイト受信に備えて再アーム
+        i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));
+      }
+      else // I2C_EVT_TX: 読み出し要求に応じて該当フレームを送信する
+      {
+        uint8_t *frame = emptyFrame;  // 未知のコマンドは長さ0の空フレームを返す
+        switch (lastCommand)
+        {
+        case CMD_ENGINE_TEMP:
+          frame = engineTempFrame;
+          break;
+        case CMD_PRI_PRE:
+          frame = priPreFrame;
+          break;
+        case CMD_SEC_PRE:
+          frame = secPreFrame;
+          break;
+        case CMD_FUEL_PRE:
+          frame = fuelPreFrame;
+          break;
+        }
+        i2c_slave_transmit(i2cSlaveHandle, frame, I2C_FRAME_SIZE, 100);
+      }
+    }
   }
 }
 
@@ -395,9 +427,30 @@ void setup()
   digitalWrite(BLUE_LED_PIN, LOW);  // 本体LED消灯
 
   // I2Cスレーブとして初期化し、M5Stack Basicからの要求に応答する
-  Wire.begin(I2C_SLAVE_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.onReceive(onI2CReceive);
-  Wire.onRequest(onI2CRequest);
+  // (ESP32-C6ではArduino Wireのスレーブ読み取り要求(onRequest)が発火しないため、
+  //  driver/i2c_slave.hを直接使用する)
+  i2cEventQueue = xQueueCreate(8, sizeof(uint8_t));
+
+  i2c_slave_config_t i2cSlaveConfig = {};
+  i2cSlaveConfig.i2c_port = -1;  // 自動選択
+  i2cSlaveConfig.sda_io_num = (gpio_num_t)I2C_SDA_PIN;
+  i2cSlaveConfig.scl_io_num = (gpio_num_t)I2C_SCL_PIN;
+  i2cSlaveConfig.clk_source = I2C_CLK_SRC_DEFAULT;
+  i2cSlaveConfig.send_buf_depth = 64;  // I2C_FRAME_SIZE(32)以上を確保
+  i2cSlaveConfig.slave_addr = I2C_SLAVE_ADDR;
+  i2cSlaveConfig.addr_bit_len = I2C_ADDR_BIT_LEN_7;
+  i2cSlaveConfig.flags.stretch_en = 1;  // 読み取り要求検出(onRequest相当)に必須
+
+  ESP_ERROR_CHECK(i2c_new_slave_device(&i2cSlaveConfig, &i2cSlaveHandle));
+
+  i2c_slave_event_callbacks_t i2cCallbacks = {};
+  i2cCallbacks.on_recv_done = onI2CReceiveDone;
+  i2cCallbacks.on_stretch_occur = onI2CStretch;
+  ESP_ERROR_CHECK(i2c_slave_register_event_callbacks(i2cSlaveHandle, &i2cCallbacks, nullptr));
+
+  i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));  // 最初の受信をアーム
+
+  xTaskCreate(i2cSlaveTask, "i2c_slave_task", 4096, nullptr, 10, nullptr);
 
   BLEDevice::init("M5NanoC6 BLE Client");
 
