@@ -70,6 +70,8 @@ static i2c_slave_dev_handle_t i2cSlaveHandle = nullptr;
 static TaskHandle_t i2cSlaveTaskHandle = nullptr;
 static uint8_t i2cCmdBuffer[1];  // 受信コマンドバイト用バッファ
 static volatile uint32_t i2cStretchEventCount = 0;  // 診断用(ISRからのインクリメントのみ、ログはタスク側で出す)
+// setup()と再初期化(resetI2CSlaveDevice)の両方から使うためファイルスコープに置く
+static i2c_slave_config_t i2cSlaveConfig = {};
 
 #define STATE_IDLE 0
 #define STATE_DO_CONNECT 1
@@ -319,6 +321,49 @@ static bool onI2CStretch(i2c_slave_dev_handle_t handle,
   return false;
 }
 
+// I2Cスレーブデバイスを(再)初期化する。i2cSlaveConfigは事前に設定済みであること
+static bool initI2CSlaveDevice()
+{
+  esp_err_t err = i2c_new_slave_device(&i2cSlaveConfig, &i2cSlaveHandle);
+  if (err != ESP_OK)
+  {
+    Serial.printf("[I2C] i2c_new_slave_device failed: %s\n", esp_err_to_name(err));
+    return false;
+  }
+
+  i2c_slave_event_callbacks_t i2cCallbacks = {};
+  i2cCallbacks.on_recv_done = onI2CReceiveDone;
+  i2cCallbacks.on_stretch_occur = onI2CStretch;
+  err = i2c_slave_register_event_callbacks(i2cSlaveHandle, &i2cCallbacks, nullptr);
+  if (err != ESP_OK)
+  {
+    Serial.printf("[I2C] i2c_slave_register_event_callbacks failed: %s\n", esp_err_to_name(err));
+    return false;
+  }
+
+  i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));  // 受信をアーム
+  return true;
+}
+
+// TXリングバッファが詰まる等でi2c_slave_transmit()が失敗し続ける場合の自己修復。
+// デバイスを作り直すことで未消費のリングバッファ内容を強制的に破棄する
+// (タスクコンテキストから呼ぶこと。ISRからは呼べない)
+static void resetI2CSlaveDevice()
+{
+  Serial.println("[I2C] resetting slave device (transmit stuck)");
+  if (i2cSlaveHandle)
+  {
+    i2c_del_slave_device(i2cSlaveHandle);
+    i2cSlaveHandle = nullptr;
+  }
+  if (!initI2CSlaveDevice())
+  {
+    // 再初期化に失敗してもクラッシュさせない(BLE接続は維持する)。
+    // 次のコマンド受信で再度失敗が続く場合はログで分かる
+    Serial.println("[I2C] slave device re-init failed");
+  }
+}
+
 // コマンド受信のたびにタスクコンテキストで呼ばれ、応答フレームをTXリングバッファに積んでおく
 // （ISR内でi2c_slave_transmit/receiveを呼ばないための橋渡し）
 static void i2cSlaveTask(void *arg)
@@ -345,14 +390,25 @@ static void i2cSlaveTask(void *arg)
       frame = fuelPreFrame;
       break;
     }
-    esp_err_t err = i2c_slave_transmit(i2cSlaveHandle, frame, I2C_FRAME_SIZE, 50);
+    // タイムアウトは短めにする。詰まっている場合はここで長時間ブロックせず
+    // 素早く検知してresetI2CSlaveDevice()に切り替えるため
+    esp_err_t err = i2c_slave_transmit(i2cSlaveHandle, frame, I2C_FRAME_SIZE, 5);
     // 診断用ログ（動作確認できたら削除/コメントアウトして問題ない）
     Serial.printf("[I2C] cmd=0x%02X transmit=%s stretch_total=%lu\n",
                   cmd, (err == ESP_OK) ? "OK" : esp_err_to_name(err),
                   (unsigned long)i2cStretchEventCount);
 
-    // 次のコマンドバイト受信に備えて再アーム
-    i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));
+    if (err == ESP_OK)
+    {
+      // 次のコマンドバイト受信に備えて再アーム
+      i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));
+    }
+    else
+    {
+      // リングバッファ詰まり等、通常の再アームでは復旧しないため
+      // デバイスごと作り直して未消費データを破棄する(受信の再アームも兼ねる)
+      resetI2CSlaveDevice();
+    }
   }
 }
 
@@ -439,7 +495,8 @@ void setup()
   // (マスター側は書き込み直後にすぐ読み取りを行うため、応答準備の遅れがそのまま失敗に直結する)
   xTaskCreate(i2cSlaveTask, "i2c_slave_task", 4096, nullptr, 20, &i2cSlaveTaskHandle);
 
-  i2c_slave_config_t i2cSlaveConfig = {};
+  // i2cSlaveConfigはファイルスコープの変数(74行目付近)。resetI2CSlaveDevice()での
+  // 再初期化時にも同じ設定を使い回すため、ここではローカル変数として再宣言しない
   i2cSlaveConfig.i2c_port = -1;  // 自動選択
   i2cSlaveConfig.sda_io_num = (gpio_num_t)I2C_SDA_PIN;
   i2cSlaveConfig.scl_io_num = (gpio_num_t)I2C_SCL_PIN;
@@ -458,14 +515,14 @@ void setup()
   // 「ストレッチ無し」なら単に空/古いフレームが返るだけで、バスは長時間ブロックしない
   i2cSlaveConfig.flags.stretch_en = 0;
 
-  ESP_ERROR_CHECK(i2c_new_slave_device(&i2cSlaveConfig, &i2cSlaveHandle));
-
-  i2c_slave_event_callbacks_t i2cCallbacks = {};
-  i2cCallbacks.on_recv_done = onI2CReceiveDone;
-  i2cCallbacks.on_stretch_occur = onI2CStretch;
-  ESP_ERROR_CHECK(i2c_slave_register_event_callbacks(i2cSlaveHandle, &i2cCallbacks, nullptr));
-
-  i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));  // 最初の受信をアーム
+  // 初期化本体はinitI2CSlaveDevice()に切り出してあり、実行時の自己修復
+  // (resetI2CSlaveDevice())からも同じ関数を呼び出す。起動時に失敗する場合は
+  // 配線・アドレス設定等の致命的な問題である可能性が高いため、従来通り停止する
+  if (!initI2CSlaveDevice())
+  {
+    Serial.println("[I2C] initial slave device init failed, halting");
+    abort();
+  }
 
   BLEDevice::init("M5NanoC6 BLE Client");
 
