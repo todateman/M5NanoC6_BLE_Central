@@ -59,11 +59,17 @@ static volatile uint8_t lastCommand = 0x00;
 // ESP-IDFネイティブI2Cスレーブドライバ関連
 // (ESP32-C6はarduino-esp32のWireライブラリのスレーブ読み取り要求(onRequest)が
 //  構造的に発火しない既知の制限があるため、Wireを使わずdriver/i2c_slave.hを直接使う)
+//
+// 重要: ESP-IDF(v5.5)のi2c_slave.c実装では、on_stretch_occurコールバックが
+// 返った直後にドライバ側が無条件でクロックストレッチを解除する(i2c_ll_slave_clear_stretch)。
+// そのためストレッチ発生(＝読み取り開始)を検知してからタスク経由で応答データを
+// 用意していては確実に間に合わない。応答フレームは、その直前に完了している
+// 「コマンドバイトの書き込み(onI2CReceiveDone)」の時点で用意し、i2c_slave_transmit()で
+// TXリングバッファへ積んでおく必要がある(読み取り開始時にはFIFOに既にデータがある状態にする)。
 static i2c_slave_dev_handle_t i2cSlaveHandle = nullptr;
-static QueueHandle_t i2cEventQueue = nullptr;
+static TaskHandle_t i2cSlaveTaskHandle = nullptr;
 static uint8_t i2cCmdBuffer[1];  // 受信コマンドバイト用バッファ
-
-enum { I2C_EVT_RX, I2C_EVT_TX };
+static volatile uint32_t i2cStretchEventCount = 0;  // 診断用(ISRからのインクリメントのみ、ログはタスク側で出す)
 
 #define STATE_IDLE 0
 #define STATE_DO_CONNECT 1
@@ -287,67 +293,61 @@ static void notifyCallback(
   }
 }
 
-// M5Stack Basic（I2Cマスター）からのコマンド書き込み受信完了時にISRコンテキストで呼ばれる
+// M5Stack Basic（I2Cマスター）からのコマンド書き込み受信完了時にISRコンテキストで呼ばれる。
+// この時点でコマンドに対応する応答フレームをタスクに用意させる（読み取り開始を待ってからでは遅い）
 static bool onI2CReceiveDone(i2c_slave_dev_handle_t handle,
                               const i2c_slave_rx_done_event_data_t *evt, void *arg)
 {
   lastCommand = evt->buffer[0];
-  uint8_t e = I2C_EVT_RX;
   BaseType_t hpw = pdFALSE;
-  xQueueSendFromISR(i2cEventQueue, &e, &hpw);
+  vTaskNotifyGiveFromISR(i2cSlaveTaskHandle, &hpw);
   return hpw == pdTRUE;
 }
 
-// M5Stack Basic（I2Cマスター）の読み出し要求でSCLがストレッチされた瞬間にISRコンテキストで呼ばれる
-// (Wire.onRequest相当。ESP32-C6ではクロックストレッチ通知が読み取り要求検出の代替手段になる)
+// M5Stack Basic（I2Cマスター）の読み出し要求でSCLがストレッチされた瞬間にISRコンテキストで呼ばれる。
+// ドライバはこのコールバックが返った直後に無条件でストレッチを解除するため、ここでは応答データを
+// 用意できない（Serial出力もISRからは非安全なため行わない）。カウントのみ記録し、タスク側で参照する
 static bool onI2CStretch(i2c_slave_dev_handle_t handle,
                           const i2c_slave_stretch_event_data_t *evt, void *arg)
 {
-  if (evt->stretch_cause == I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH)
-  {
-    uint8_t e = I2C_EVT_TX;
-    BaseType_t hpw = pdFALSE;
-    xQueueSendFromISR(i2cEventQueue, &e, &hpw);
-    return hpw == pdTRUE;
-  }
+  i2cStretchEventCount = i2cStretchEventCount + 1;  // volatileへの++はC++20で非推奨のため加算代入で書く
   return false;
 }
 
-// I2Cイベントをタスクコンテキストで処理する（ISR内でi2c_slave_transmit/receiveを呼ばないための橋渡し）
+// コマンド受信のたびにタスクコンテキストで呼ばれ、応答フレームをTXリングバッファに積んでおく
+// （ISR内でi2c_slave_transmit/receiveを呼ばないための橋渡し）
 static void i2cSlaveTask(void *arg)
 {
   static uint8_t emptyFrame[I2C_FRAME_SIZE] = {0};
-  uint8_t evt;
   for (;;)
   {
-    if (xQueueReceive(i2cEventQueue, &evt, portMAX_DELAY) == pdTRUE)
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    uint8_t *frame = emptyFrame;  // 未知のコマンドは長さ0の空フレームを返す
+    uint8_t cmd = lastCommand;
+    switch (cmd)
     {
-      if (evt == I2C_EVT_RX)
-      {
-        // 次のコマンドバイト受信に備えて再アーム
-        i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));
-      }
-      else // I2C_EVT_TX: 読み出し要求に応じて該当フレームを送信する
-      {
-        uint8_t *frame = emptyFrame;  // 未知のコマンドは長さ0の空フレームを返す
-        switch (lastCommand)
-        {
-        case CMD_ENGINE_TEMP:
-          frame = engineTempFrame;
-          break;
-        case CMD_PRI_PRE:
-          frame = priPreFrame;
-          break;
-        case CMD_SEC_PRE:
-          frame = secPreFrame;
-          break;
-        case CMD_FUEL_PRE:
-          frame = fuelPreFrame;
-          break;
-        }
-        i2c_slave_transmit(i2cSlaveHandle, frame, I2C_FRAME_SIZE, 100);
-      }
+    case CMD_ENGINE_TEMP:
+      frame = engineTempFrame;
+      break;
+    case CMD_PRI_PRE:
+      frame = priPreFrame;
+      break;
+    case CMD_SEC_PRE:
+      frame = secPreFrame;
+      break;
+    case CMD_FUEL_PRE:
+      frame = fuelPreFrame;
+      break;
     }
+    esp_err_t err = i2c_slave_transmit(i2cSlaveHandle, frame, I2C_FRAME_SIZE, 50);
+    // 診断用ログ（動作確認できたら削除/コメントアウトして問題ない）
+    Serial.printf("[I2C] cmd=0x%02X transmit=%s stretch_total=%lu\n",
+                  cmd, (err == ESP_OK) ? "OK" : esp_err_to_name(err),
+                  (unsigned long)i2cStretchEventCount);
+
+    // 次のコマンドバイト受信に備えて再アーム
+    i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));
   }
 }
 
@@ -429,7 +429,10 @@ void setup()
   // I2Cスレーブとして初期化し、M5Stack Basicからの要求に応答する
   // (ESP32-C6ではArduino Wireのスレーブ読み取り要求(onRequest)が発火しないため、
   //  driver/i2c_slave.hを直接使用する)
-  i2cEventQueue = xQueueCreate(8, sizeof(uint8_t));
+  // タスクはコールバック登録より前に生成する(ISRからvTaskNotifyGiveFromISRで直接参照するため)。
+  // 優先度は高め(20)にして、コマンド受信からTX準備完了までをできるだけ短くする
+  // (マスター側は書き込み直後にすぐ読み取りを行うため、応答準備の遅れがそのまま失敗に直結する)
+  xTaskCreate(i2cSlaveTask, "i2c_slave_task", 4096, nullptr, 20, &i2cSlaveTaskHandle);
 
   i2c_slave_config_t i2cSlaveConfig = {};
   i2cSlaveConfig.i2c_port = -1;  // 自動選択
@@ -439,7 +442,7 @@ void setup()
   i2cSlaveConfig.send_buf_depth = 64;  // I2C_FRAME_SIZE(32)以上を確保
   i2cSlaveConfig.slave_addr = I2C_SLAVE_ADDR;
   i2cSlaveConfig.addr_bit_len = I2C_ADDR_BIT_LEN_7;
-  i2cSlaveConfig.flags.stretch_en = 1;  // 読み取り要求検出(onRequest相当)に必須
+  i2cSlaveConfig.flags.stretch_en = 1;  // 応答準備が万一遅れた場合の保険として有効化
 
   ESP_ERROR_CHECK(i2c_new_slave_device(&i2cSlaveConfig, &i2cSlaveHandle));
 
@@ -449,8 +452,6 @@ void setup()
   ESP_ERROR_CHECK(i2c_slave_register_event_callbacks(i2cSlaveHandle, &i2cCallbacks, nullptr));
 
   i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));  // 最初の受信をアーム
-
-  xTaskCreate(i2cSlaveTask, "i2c_slave_task", 4096, nullptr, 10, nullptr);
 
   BLEDevice::init("M5NanoC6 BLE Client");
 
