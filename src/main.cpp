@@ -138,11 +138,15 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
 {
   void onResult(BLEAdvertisedDevice advertisedDevice)
   {
-    Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str());
+    // 周囲のBLEデバイスすべてに対して呼ばれるため、無条件のSerial.printf(CORE_DEBUG_LEVELの
+    // 制御対象外で常に出力される)は周辺機器の多い環境ではCPU/シリアル送信時間を大きく消費し、
+    // I2C応答タスクのスケジューリング遅延（TXリングバッファのオーバーフロー）の一因になっていた。
+    // 対象のService UUIDを持つデバイスのみログを出す
     if (!advertisedDevice.haveServiceUUID() || !advertisedDevice.isAdvertisingService(serviceUUID))
     {
       return;
     }
+    Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str());
 
     // Service UUIDはHeater/AutoAirAdjustで共通のため、アドバタイズ名でどちらかを判別する
     String name = advertisedDevice.getName().c_str();
@@ -440,7 +444,9 @@ void setup()
   i2cSlaveConfig.sda_io_num = (gpio_num_t)I2C_SDA_PIN;
   i2cSlaveConfig.scl_io_num = (gpio_num_t)I2C_SCL_PIN;
   i2cSlaveConfig.clk_source = I2C_CLK_SRC_DEFAULT;
-  i2cSlaveConfig.send_buf_depth = 64;  // I2C_FRAME_SIZE(32)以上を確保
+  // 未読了のフレームが溜まった場合の保険として、I2C_FRAME_SIZE(32)の4フレーム分を確保
+  // (実際に "no space in ringbuffer" エラーが観測されたため、2フレーム分(64)から拡大)
+  i2cSlaveConfig.send_buf_depth = 128;
   i2cSlaveConfig.slave_addr = I2C_SLAVE_ADDR;
   i2cSlaveConfig.addr_bit_len = I2C_ADDR_BIT_LEN_7;
   i2cSlaveConfig.intr_priority = 3;  // BLEスキャン処理との競合による割り込み遅延を減らすため明示的に高めに設定
