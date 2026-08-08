@@ -198,15 +198,18 @@ private:
   int peripheralIndex;
 };
 
-// 文字列データを長さプレフィックス付きのI2C送信用フレームに変換して格納する
+// 文字列データを長さプレフィックス付きのI2C送信用フレームに変換して格納する。
+// 末尾1byte(frame[I2C_FRAME_SIZE-1])はコマンドエコー用に予約し、ここでは触れない
+// (実際の値はi2cSlaveTaskが送信直前に設定する。マスター側でコマンドと応答のズレを
+//  検知できるようにするための仕組み。詳細はi2cSlaveTaskのコメント参照)
 static void updateFrame(uint8_t *frame, const String &value)
 {
-  size_t dataLen = min(value.length(), (size_t)(I2C_FRAME_SIZE - 1));
+  size_t dataLen = min(value.length(), (size_t)(I2C_FRAME_SIZE - 2));
   frame[0] = (uint8_t)dataLen;
   memcpy(&frame[1], value.c_str(), dataLen);
-  if (dataLen < I2C_FRAME_SIZE - 1)
+  if (dataLen < I2C_FRAME_SIZE - 2)
   {
-    memset(&frame[1 + dataLen], 0, I2C_FRAME_SIZE - 1 - dataLen);
+    memset(&frame[1 + dataLen], 0, I2C_FRAME_SIZE - 2 - dataLen);
   }
 }
 
@@ -369,6 +372,10 @@ static void resetI2CSlaveDevice()
 static void i2cSlaveTask(void *arg)
 {
   static uint8_t emptyFrame[I2C_FRAME_SIZE] = {0};
+  // 送信用の一時バッファ。共有のフレーム配列(engineTempFrame等)を直接書き換えず、
+  // ここにコピーしてからコマンドエコーを埋め込む(BLE Notifyコールバック側からの
+  // 書き込みと競合させないため)
+  static uint8_t txBuffer[I2C_FRAME_SIZE];
   for (;;)
   {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -390,9 +397,16 @@ static void i2cSlaveTask(void *arg)
       frame = fuelPreFrame;
       break;
     }
+
+    // 何らかの理由（バスノイズ等）でマスター側が受け取った応答が要求と異なる
+    // コマンドの分だった場合にマスター側で検知・リトライできるよう、フレーム末尾
+    // 1byteに要求されたコマンドをそのままエコーバックする
+    memcpy(txBuffer, frame, I2C_FRAME_SIZE);
+    txBuffer[I2C_FRAME_SIZE - 1] = cmd;
+
     // タイムアウトは短めにする。詰まっている場合はここで長時間ブロックせず
     // 素早く検知してresetI2CSlaveDevice()に切り替えるため
-    esp_err_t err = i2c_slave_transmit(i2cSlaveHandle, frame, I2C_FRAME_SIZE, 5);
+    esp_err_t err = i2c_slave_transmit(i2cSlaveHandle, txBuffer, I2C_FRAME_SIZE, 5);
     // 診断用ログ（動作確認できたら削除/コメントアウトして問題ない）
     Serial.printf("[I2C] cmd=0x%02X transmit=%s stretch_total=%lu\n",
                   cmd, (err == ESP_OK) ? "OK" : esp_err_to_name(err),
