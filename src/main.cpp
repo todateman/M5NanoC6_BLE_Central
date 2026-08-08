@@ -348,12 +348,29 @@ static bool initI2CSlaveDevice()
   return true;
 }
 
+// 直近のデバイス再作成から最低これだけ間隔を空ける(ミリ秒)
+static const unsigned long I2C_RESET_COOLDOWN_MS = 50;
+static unsigned long lastI2CResetMillis = 0;
+
 // TXリングバッファが詰まる等でi2c_slave_transmit()が失敗し続ける場合の自己修復。
 // デバイスを作り直すことで未消費のリングバッファ内容を強制的に破棄する
 // (タスクコンテキストから呼ぶこと。ISRからは呼べない)
 static void resetI2CSlaveDevice()
 {
+  unsigned long now = millis();
+  if (i2cSlaveHandle && (now - lastI2CResetMillis) < I2C_RESET_COOLDOWN_MS)
+  {
+    // i2c_del_slave_device+i2c_new_slave_deviceはGPIOのI2Cペリフェラルへの
+    // 再アタッチを伴い、それ自体がSDA/SCL上に瞬間的なグリッチを生んで
+    // さらなる誤検出を誘発している可能性がある。短時間に連続で発生した場合は
+    // デバイスの作り直しまでは行わず、受信の再アームのみで様子を見る
+    Serial.println("[I2C] transmit stuck, but skipping full reset (cooldown)");
+    i2c_slave_receive(i2cSlaveHandle, i2cCmdBuffer, sizeof(i2cCmdBuffer));
+    return;
+  }
+
   Serial.println("[I2C] resetting slave device (transmit stuck)");
+  lastI2CResetMillis = now;
   if (i2cSlaveHandle)
   {
     i2c_del_slave_device(i2cSlaveHandle);
@@ -515,9 +532,10 @@ void setup()
   i2cSlaveConfig.sda_io_num = (gpio_num_t)I2C_SDA_PIN;
   i2cSlaveConfig.scl_io_num = (gpio_num_t)I2C_SCL_PIN;
   i2cSlaveConfig.clk_source = I2C_CLK_SRC_DEFAULT;
-  // 未読了のフレームが溜まった場合の保険として、I2C_FRAME_SIZE(32)の4フレーム分を確保
-  // (実際に "no space in ringbuffer" エラーが観測されたため、2フレーム分(64)から拡大)
-  i2cSlaveConfig.send_buf_depth = 128;
+  // 未読了のフレームが溜まった場合の保険として、I2C_FRAME_SIZE(32)の8フレーム分を確保。
+  // 突発的な多重コマンド受信があってもリセット(自体がバス上のグリッチを誘発しうる)に
+  // 頼らず吸収できる余地を増やす (2→4→8フレーム分と段階的に拡大)
+  i2cSlaveConfig.send_buf_depth = 256;
   i2cSlaveConfig.slave_addr = I2C_SLAVE_ADDR;
   i2cSlaveConfig.addr_bit_len = I2C_ADDR_BIT_LEN_7;
   i2cSlaveConfig.intr_priority = 3;  // BLEスキャン処理との競合による割り込み遅延を減らすため明示的に高めに設定
