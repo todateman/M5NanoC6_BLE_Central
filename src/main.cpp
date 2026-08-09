@@ -26,9 +26,18 @@
 #define TAG_SEC_PRE "SEC:"
 #define TAG_FUEL_PRE "FUEL:"
 
-// オンボードRGB LEDの青色を使用(Xiao nRF52840はGrove非搭載のため外付けLEDではなく内蔵LEDを流用)。
-// LED_BLUE/LED_STATE_ON はvariant.hで定義される(Xiao nRF52840はactive-high。
-// digitalWrite(BLUE_LED_PIN, LED_STATE_ON)で点灯、!LED_STATE_ONで消灯すれば極性を意識せず書ける)
+// オンボードLEDでBLE接続状態を表示する(Xiao nRF52840はGrove非搭載のため
+// 外付けLEDではなく内蔵LEDを流用)。variant.hは LED_STATE_ON=1 (active-high)と
+// 定義しているが、実機検証の結果、赤色(LED_RED)・青色(LED_BLUE)ともに実際には
+// active-low(LOWを出力すると点灯)であることが判明した(LED_STATE_ONで点灯させたつもりが
+// 消灯し、!LED_STATE_ONで消灯させたつもりが点灯する現象を確認)。
+// variant.hの定義自体は他ライブラリへの影響を避けるため変更せず、
+// 本ファイル内でのみ実機の実際の極性に合わせたLED_ON/LED_OFFを定義し、
+// 以降はLED_STATE_ONを直接使わずこちらを使う。
+// 表示方式は赤=Heater/AutoAirAdjustのいずれか未接続、青=両方接続完了の排他点灯
+// (詳細はupdateConnectionLed()を参照)
+#define LED_ON  (!LED_STATE_ON)
+#define LED_OFF (LED_STATE_ON)
 #define BLUE_LED_PIN LED_BLUE
 
 // ServerのBLE サービスとキャラクタリスティックのUUIDを定義 https://www.uuidgenerator.net/version4
@@ -45,8 +54,6 @@
 #define AUTOAIR_CHARACTERISTIC_UUID "c9f878f1-c311-4452-ae5e-e813b4fe057d"
 #define AUTOAIR_NOTIFY_CHARACTERISTIC_UUID "1d25ec49-e19c-4bb6-8c36-5dc8d8aaaebe"
 
-static unsigned long ledOnTime = 0;  // LED点灯開始時刻
-static const unsigned long LED_ON_DURATION = 500;  // LED点灯時間（ミリ秒）
 static const size_t RX_BUFFER_MAX = 256;  // Notify受信バッファの最大サイズ
 
 // 各データのI2C送信用フレーム（先頭1byteが長さ、以降が実データ）。M5Stack Basicからの要求時に最新値を返す
@@ -116,6 +123,22 @@ static bool needsScan()
   return false;
 }
 
+// 接続状態表示LEDを更新する。Heater/AutoAirAdjustの両方が接続完了していれば
+// 青色のみ、いずれか未接続なら赤色のみを点灯する(排他点灯)。
+// setup()での初期化直後、および接続/切断イベント発生時(connectCallback/disconnectCallback)に呼ばれる
+static void updateConnectionLed()
+{
+  bool allConnected = !needsScan();
+  // 診断用ログ: 呼ばれるたびに各ペリフェラルの状態を出力する
+  // (state値: STATE_IDLE=0 / STATE_DO_CONNECT=1 / STATE_CONNECTED=3)
+  Serial.printf("[LED] %s=%d %s=%d -> %s\n",
+                peripherals[PERIPH_HEATER].name, peripherals[PERIPH_HEATER].state,
+                peripherals[PERIPH_AUTOAIR].name, peripherals[PERIPH_AUTOAIR].state,
+                allConnected ? "BLUE(connected)" : "RED(not connected)");
+  digitalWrite(LED_RED, allConnected ? LED_OFF : LED_ON);
+  digitalWrite(BLUE_LED_PIN, allConnected ? LED_ON : LED_OFF);
+}
+
 // アドバタイズ名からペリフェラルのインデックスを引く
 static int findPeripheralByName(const char *name)
 {
@@ -162,8 +185,6 @@ static void notifyCallback(BLEClientCharacteristic *chr, uint8_t *data, uint16_t
   }
   String &rxBuffer = peripherals[idx].rxBuffer;
 
-  digitalWrite(BLUE_LED_PIN, LED_STATE_ON);  // 本体LED点灯
-  ledOnTime = millis();  // LED点灯開始時刻を記録
   Serial.print("Notify callback for characteristic ");
   Serial.print(chr->uuid.toString());
   Serial.print(" of data length ");
@@ -257,18 +278,35 @@ static bool discoverAndSubscribe(PeripheralContext &p, uint16_t conn_handle)
   return true;
 }
 
-// 接続確立時に呼ばれる。Service UUIDが共通なため、接続先の判別はここでピア名から行う
+// 接続確立時に呼ばれる。接続先の判別は、スキャン時点(scanCallback)で広告データの
+// Complete Local Nameから既に確定させ、STATE_DO_CONNECTにマークしておいた
+// ペリフェラルをそのまま使う。
+// (以前はここでBLEConnection::getPeerName()によりGATT経由で標準GAP Device Name
+//  キャラクタリスティック(0x2A00)をライブ読み出しして再判別していたが、本プロジェクトは
+//  ATT MTUを既定値(23byte)のまま使っており、Read By Type応答が運べる値の最大長は
+//  MTU-4=19byteしかない。"ChibiT-AutoAirAdjust"(20byte)・"M5Din Furoshiki Heater"(22byte)
+//  はいずれも19byteを超えるため末尾が切り詰められて返ってきてしまい、findPeripheralByName()
+//  が必ず不一致になって「Unexpected device connected」として即切断される不具合があった。
+//  STATE_DO_CONNECTになり得るのは常に高々1台のみ(connect()呼び出し後はスキャナーが
+//  一時停止し、次の接続試行はこの接続がconnectCallback/disconnectCallbackで解決してから
+//  再開されるため)なので、これで一意に判別できる)
 static void connectCallback(uint16_t conn_handle)
 {
-  char nameBuf[32] = {0};
-  Bluefruit.Connection(conn_handle)->getPeerName(nameBuf, sizeof(nameBuf) - 1);
+  int idx = -1;
+  for (int i = 0; i < PERIPH_COUNT; i++)
+  {
+    if (peripherals[i].state == STATE_DO_CONNECT)
+    {
+      idx = i;
+      break;
+    }
+  }
 
-  int idx = findPeripheralByName(nameBuf);
   if (idx < 0)
   {
-    // 想定外のデバイスが接続した（スキャン段階でService UUID+名前を絞り込んでいるため
-    // 基本的に発生しないが、念のため切断する）
-    Serial.printf("Unexpected device connected (%s), disconnecting\n", nameBuf);
+    // 接続試行中のペリフェラルが1つも無い状態で接続イベントを受信した（基本的に発生しないが、
+    // 念のため切断する）
+    Serial.println("Unexpected connection (no pending connect target), disconnecting");
     Bluefruit.disconnect(conn_handle);
     return;
   }
@@ -287,6 +325,8 @@ static void connectCallback(uint16_t conn_handle)
     Bluefruit.disconnect(conn_handle);
     resetPeripheral(idx);
   }
+
+  updateConnectionLed();  // 接続状態表示LEDを更新（両方揃って初めて青色になる）
 
   // 未接続のペリフェラルが残っていればスキャンを継続する
   // (Central.connect()呼び出し後スキャナーは一時停止しているため、明示的な再開が必要)
@@ -309,6 +349,8 @@ static void disconnectCallback(uint16_t conn_handle, uint8_t reason)
       break;
     }
   }
+
+  updateConnectionLed();  // 未接続に戻ったので接続状態表示LEDを更新（黄色に戻す）
 }
 
 // スキャン結果を受信するたびに呼ばれる。SoftDevice仕様上、レポート受信のたびに
@@ -391,15 +433,13 @@ static void requestEvent()
 void setup()
 {
   // Serial/BLE初期化より前の、最速の起動チェックポイント。ここでLED_REDが3回点滅しなければ
-  // Arduino setup()にすら到達できていない(電源/書き込み自体の問題)と切り分けられる。
-  // LED_BLUEはBluefruitがスキャン中/接続中の状態表示に自動で使う(後述)ため、
-  // この起動チェックには使わずLED_REDを使う
+  // Arduino setup()にすら到達できていない(電源/書き込み自体の問題)と切り分けられる
   pinMode(LED_RED, OUTPUT);
   for (int i = 0; i < 3; i++)
   {
-    digitalWrite(LED_RED, LED_STATE_ON);
+    digitalWrite(LED_RED, LED_ON);
     delay(100);
-    digitalWrite(LED_RED, !LED_STATE_ON);
+    digitalWrite(LED_RED, LED_OFF);
     delay(100);
   }
 
@@ -419,9 +459,6 @@ void setup()
   Serial.printf("I2C slave addr=0x%02X (SDA=D4, SCL=D5)\n", I2C_SLAVE_ADDR);
   Serial.printf("Target peripherals: %s / %s\n", HEATER_DEVICE_NAME, AUTOAIR_DEVICE_NAME);
 
-  pinMode(BLUE_LED_PIN, OUTPUT);
-  digitalWrite(BLUE_LED_PIN, !LED_STATE_ON);  // 本体LED消灯
-
   // I2Cスレーブとして初期化し、M5Stack Basicからの要求に応答する
   // (nRF52840はI2Cマスター(TWIM)とスレーブ(TWIS)が別ペリフェラルのため、標準Wireの
   //  スレーブモードがそのまま使える。ESP32-C6版のESP-IDFネイティブAPI直接呼び出しは不要)
@@ -432,10 +469,15 @@ void setup()
   // ここに到達したかを切り分けるための中間チェックポイント(中くらいの速さで1回点滅)。
   // これが見えた後、何の反応もなくなる(以降のチェックポイントも出ない)場合は
   // Bluefruit.begin()内部でのハードフォルト(SoftDeviceの有効化失敗等)が疑われる
-  digitalWrite(LED_RED, LED_STATE_ON);
+  digitalWrite(LED_RED, LED_ON);
   delay(200);
-  digitalWrite(LED_RED, !LED_STATE_ON);
+  digitalWrite(LED_RED, LED_OFF);
   delay(200);
+
+  // 接続状態表示用LEDのピン初期化。この時点ではまだ何にも接続していないため、
+  // updateConnectionLed()で初期状態(赤点灯=未接続)にしておく
+  pinMode(BLUE_LED_PIN, OUTPUT);
+  updateConnectionLed();
 
   // BLE Central初期化 (Peripheralロールは使わないため0、Central接続はPERIPH_COUNT台分確保)。
   // 失敗する場合はSoftDevice用RAM不足等の致命的な問題である可能性が高いため、
@@ -448,16 +490,16 @@ void setup()
     while (true)
     {
       Serial.println("FATAL: Bluefruit.begin() failed");
-      digitalWrite(LED_RED, LED_STATE_ON);
+      digitalWrite(LED_RED, LED_ON);
       delay(1000);
-      digitalWrite(LED_RED, !LED_STATE_ON);
+      digitalWrite(LED_RED, LED_OFF);
       delay(1000);
     }
   }
   Bluefruit.setName("XiaoNRF52840 BLE Client");
   // BluefruitはデフォルトでLED_BLUEをスキャン中/接続中の状態表示に自動使用するが、
-  // 本プロジェクトではLED_BLUE(BLUE_LED_PIN)をNotify受信インジケータとして使うため、
-  // Bluefruit側の自動制御は無効化して競合を避ける
+  // 本プロジェクトでは独自のupdateConnectionLed()(赤=未接続/青=両方接続完了の排他点灯)で
+  // LED_BLUEを制御するため、Bluefruit側の自動制御は無効化して競合を避ける
   Bluefruit.autoConnLed(false);
 
   // 各ペリフェラルのサービス・キャラクタリスティックをBluefruitへ登録する
@@ -476,11 +518,18 @@ void setup()
 
   // Interval/Windowはdefaultの値で動作して問題なさそうなため設定しない。
   // Heater/AutoAirAdjustいずれもデバイス名が128bit Service UUIDと合わせるとレガシー広告パケットに
-  // 収まらないため、名前はScan Responseに回される。名前でのペリフェラル判別にはScan Responseの
-  // 取得が必須のため、アクティブスキャンにする(パッシブでは名前が空になり判別できない)
+  // 収まらないため、Service UUIDはADV_IND(プライマリ広告)側、名前はScan Response側という
+  // 別々のパケットに分かれて送られてくる。
+  // filterUuid()はレポート1件(=1パケット)ごとに単独で判定されるため、これを設定すると
+  // 名前が載っているScan Response側のレポートはUUIDを含まないという理由でscanCallback()に
+  // 渡される前に捨てられてしまい、Complete Local Nameを一切取得できず永久に接続できなくなる
+  // (実際にこれが原因でAutoAirAdjust/Heaterのどちらにも接続できない不具合が発生していた)。
+  // Service UUIDによる正当性検証は接続確立後にdiscoverAndSubscribe()内のservice.discover()で
+  // 別途行っているため、スキャン時点でのUUIDフィルタは不要。よってfilterUuid()は使用せず、
+  // 名前でのペリフェラル判別にはScan Responseの取得が必須のため、アクティブスキャンのみ有効にする
+  // (パッシブでは名前が空になり判別できない)
   Bluefruit.Scanner.setRxCallback(scanCallback);
   Bluefruit.Scanner.restartOnDisconnect(true);  // 切断時に自動で再スキャンを開始する
-  Bluefruit.Scanner.filterUuid(serviceUuid);
   Bluefruit.Scanner.useActiveScan(true);
   Bluefruit.Scanner.start(0);  // 0 = タイムアウトなしで継続スキャン
 
@@ -489,13 +538,7 @@ void setup()
 
 void loop()
 {
-  // LED点灯時間後に自動消灯
-  if (ledOnTime > 0 && (millis() - ledOnTime) >= LED_ON_DURATION)
-  {
-    digitalWrite(BLUE_LED_PIN, !LED_STATE_ON);  // 本体LED消灯
-    ledOnTime = 0;
-  }
-
-  // BLE(スキャン/接続/Notify)・I2Cスレーブ応答は全てコールバック駆動のため、
-  // loop()側で行う処理はLED自動消灯のみ
+  // BLE(スキャン/接続/Notify)・I2Cスレーブ応答・接続状態表示LEDの更新は全て
+  // コールバック駆動(connectCallback/disconnectCallback/notifyCallback/receiveEvent/
+  // requestEvent)のため、loop()側で行う処理は無い
 }

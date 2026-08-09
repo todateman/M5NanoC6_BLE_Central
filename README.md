@@ -1,7 +1,7 @@
-# M5NanoC6 BLE Central → Seeed Xiao nRF52840 移植版
+﻿# M5NanoC6 BLE Central → Seeed Xiao nRF52840 移植版
 
 [Seeed Xiao nRF52840](https://wiki.seeedstudio.com/XIAO_BLE/) を使用した BLE Central (クライアント) 実装サンプルです。  
-M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために本ボードを外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを I2C スレーブとして保持し、M5Stack Basic（I2C マスター）からの読み出し要求に応じて返します。  
+M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために本ボードを外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを I2C スレーブとして保持し、[Chibi-T_Furoshiki_Logger](https://github.com/todateman/Chibi-T_Furoshiki_Logger)の M5Stack Basic（I2C マスター）からの読み出し要求に応じて返します。  
 （I2Cスレーブアドレス: 0x08, SDA=D4, SCL=D5）
 
 > 本プロジェクトはもともと [M5NanoC6](https://docs.m5stack.com/ja/core/M5NanoC6)（ESP32-C6）向けに実装されていましたが、arduino-esp32 の `Wire` ライブラリが ESP32-C6 では I2C スレーブの読み取り要求 (`onRequest`) を構造的に発火できないという既知の制限があり、ESP-IDF ネイティブ API への切り替え・クロックストレッチ調整・自己修復ロジックなど対症療法的な対応を重ねても安定しなかったため、I2C マスター(TWIM)とスレーブ(TWIS)が別ハードウェアペリフェラルである **Seeed Xiao nRF52840** に切り替えました。詳細は後述の「スレーブ側の実装メモ」を参照してください。
@@ -10,10 +10,11 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
 
 - Arduino フレームワーク（Adafruit nRF52 Arduino コア、`Bluefruit52Lib` 使用）
 - BLE Central: Heater / AutoAirAdjust 2台の BLE ペリフェラルに**同時接続**（Service UUID は共通のため、アドバタイズ名で判別）→ Notify 購読
-- Notify 受信で LED(青、オンボードRGB LED) 点灯し、受信データを32バイト固定フレームに格納して保持
+- Notify 受信データを32バイト固定フレームに格納して保持
+- オンボードLED(赤/青)で接続状態を表示（いずれか未接続=赤、Heater・AutoAirAdjust両方接続完了=青の排他点灯。詳細は後述）
 - I2C スレーブ化（アドレス 0x08、コマンドで要求データの種類を指定して応答。標準 `Wire` ライブラリの `onReceive`/`onRequest` を使用、詳細は後述）
 - PlatformIO プロジェクト構成（複数 env 拡張可能）
-- BLE/I2C ともにコールバック駆動（`loop()` は LED の自動消灯のみ）
+- BLE/I2C/LED更新ともにコールバック駆動（`loop()` は何も行わない）
 
 ## ハードウェア要件
 
@@ -58,18 +59,29 @@ Service UUID は両ペリフェラルで共通のため、接続先の判別は 
 ## 動作概要
 
 1. 起動時に I2C スレーブと BLE Central を初期化し、アクティブスキャンを開始  
-   （Service UUID は共通のため、アドバタイズ名で Heater / AutoAirAdjust を判別する。両者ともデバイス名が Scan Response 側に含まれるため、名前判別にはアクティブスキャンが必須）
-2. 対象デバイスを検出すると接続要求（見つかった方から順に、部分的な接続を許容。片方だけでも正常に動作する）
+   （Service UUID は共通のため、アドバタイズ名で Heater / AutoAirAdjust を判別する。両者ともデバイス名が Scan Response 側に含まれるため、名前判別にはアクティブスキャンが必須。**Scanner の `filterUuid()` は使用しない**——Service UUID は ADV_IND 側、名前は Scan Response 側という別々のパケットに分かれて送られてくるため、UUIDフィルタを設定すると名前が載っている側のパケットが「UUIDを含まない」という理由で `scanCallback()` に渡る前に捨てられてしまい、永久に接続できなくなる不具合があった）
+2. 対象デバイスを検出すると接続要求（見つかった方から順に、部分的な接続を許容。片方だけでも正常に動作する）。この時点で該当ペリフェラルを `STATE_DO_CONNECT` としてマークしておく
 3. 接続後（`connectCallback`）:
+   - 接続先の判別は、スキャン時点で `STATE_DO_CONNECT` にマークしておいたペリフェラルをそのまま使う（以前は接続後に `BLEConnection::getPeerName()` でGATT経由のGAP Device Nameキャラクタリスティックを読み直して判別していたが、本プロジェクトが使う既定ATT MTU(23byte)ではRead By Type応答が最大19byteしか運べず、`"ChibiT-AutoAirAdjust"`(20byte)や`"M5Din Furoshiki Heater"`(22byte)のような名前が末尾で切り詰められて必ず不一致になり、「Unexpected device connected」として即切断される不具合があったため撤廃した）
    - Service / Write キャラクタリスティックの探索（Write キャラクタリスティックは現状未使用／将来拡張枠）
    - Notify キャラクタリスティック探索・購読登録
+   - 接続状態表示LEDを更新（後述）
 4. Notify 受信（`notifyCallback`）:
-   - 青色 LED 点灯 (次ループで消灯)
    - 改行までのデータを先頭タグ（`PRI:` / `SEC:` / `FUEL:` / タグなし）で判別し、対応する I2C 送信用フレーム（`priPreFrame` / `secPreFrame` / `fuelPreFrame` / `engineTempFrame`）に格納・保持し、M5Stack Basic からの要求を待機
    - Heater / AutoAirAdjust それぞれ専用の受信バッファを保持するため、2台からの Notify が混ざることはない
 5. 未接続のペリフェラルが残っている限り、スキャンを継続する（`Bluefruit.Scanner` がコールバック駆動でスキャンを管理するため、`loop()` 側でのポーリングは不要）
 6. 切断イベント発生時（`disconnectCallback`）:
    - 切断されたペリフェラルのみ状態をリセットし、`Bluefruit.Scanner.restartOnDisconnect(true)` により自動的に再スキャン・再接続を試みる（もう一方の接続は維持される）
+   - 接続状態表示LEDを更新（後述）
+
+### 接続状態表示LED
+
+`updateConnectionLed()` が接続/切断イベントのたびに呼ばれ、赤色LEDと青色LEDを排他的に点灯する。
+
+- Heater・AutoAirAdjustのいずれか未接続: **赤色LEDのみ**点灯
+- Heater・AutoAirAdjust両方接続完了: **青色LEDのみ**点灯
+
+実機検証の結果、Xiao nRF52840のオンボードLED(赤・青)は `variant.h` の定義（`LED_STATE_ON=1`、active-high）とは逆に、実際には **active-low**（LOWを出力すると点灯）であることが判明した。`variant.h` 自体は他ライブラリへの影響を避けるため変更せず、`src/main.cpp` 内でのみ実機の実際の極性に合わせた `LED_ON` / `LED_OFF` マクロを定義し、以降はこちらを使用する。
 
 ### シンプルなデータフロー（論理）
 
@@ -203,13 +215,17 @@ Device found! (M5Din Furoshiki Heater)
 [M5Din Furoshiki Heater] - Found our characteristic
 [M5Din Furoshiki Heater] - Registered for notify
 Connected to server (M5Din Furoshiki Heater)
+[LED] M5Din Furoshiki Heater=3 ChibiT-AutoAirAdjust=0 -> RED(not connected)
 Device found! (ChibiT-AutoAirAdjust)
 [ChibiT-AutoAirAdjust] - Found our service
 [ChibiT-AutoAirAdjust] - Found our characteristic
 [ChibiT-AutoAirAdjust] - Registered for notify
 Connected to server (ChibiT-AutoAirAdjust)
+[LED] M5Din Furoshiki Heater=3 ChibiT-AutoAirAdjust=3 -> BLUE(connected)
 Notify callback for characteristic ... of data length N
 ```
+
+`[LED] ...` 行は `updateConnectionLed()` が接続/切断イベントのたびに出力する診断ログで、各ペリフェラルの状態（`STATE_IDLE=0` / `STATE_DO_CONNECT=1` / `STATE_CONNECTED=3`）と、その結果として点灯させたLEDの色を確認できる。
 
 ## カスタマイズポイント
 
@@ -217,7 +233,7 @@ Notify callback for characteristic ... of data length N
 - I2Cピン: Xiao nRF52840の既定Wireピン（D4=SDA, D5=SCL）を使用。変更する場合は `Wire.begin()` の前に `Wire.setPins(sda, scl)` を呼び出す
 - フレームサイズ: `#define I2C_FRAME_SIZE 32` で変更可（データ本体は `I2C_FRAME_SIZE - 2` バイトまで、末尾1byteはコマンドエコー用）
 - コマンド: `CMD_ENGINE_TEMP` / `CMD_PRI_PRE` / `CMD_SEC_PRE` / `CMD_FUEL_PRE` を定義済み。さらに他のデータを中継する場合は新しいコマンド定数とフレーム/ハンドリング（および必要ならタグ文字列）を追加。応答フレームの選択ロジックは `frameForCommand()`（`receiveEvent` から呼ばれる）に実装されている点に注意
-- LED ピン: `#define BLUE_LED_PIN LED_BLUE`（オンボードRGB LEDの青。`LED_STATE_ON` マクロで極性を吸収しているため点灯/消灯の記述に極性を意識する必要はない）
+- LED ピン: `LED_RED` / `#define BLUE_LED_PIN LED_BLUE`（オンボードLEDの赤・青。実機がactive-lowだったため独自定義した `LED_ON` / `LED_OFF` マクロで極性を吸収しているため、点灯/消灯の記述に極性を意識する必要はない）
 - UUID: `SERVICE_UUID`（共通）/ `HEATER_CHARACTERISTIC_UUID` / `HEATER_NOTIFY_CHARACTERISTIC_UUID` / `AUTOAIR_CHARACTERISTIC_UUID` / `AUTOAIR_NOTIFY_CHARACTERISTIC_UUID` で差し替え可能
 - デバイス名フィルタ: `HEATER_DEVICE_NAME` / `AUTOAIR_DEVICE_NAME`（接続先の判別に使用、Service UUID が共通のため必須）
 - 再接続ポリシー: 切断されたペリフェラルのみ `resetPeripheral()` で状態をリセットし、`Bluefruit.Scanner.restartOnDisconnect(true)` により自動的に再接続を試みる（もう一方の接続には影響しない）
@@ -231,8 +247,8 @@ Notify callback for characteristic ... of data length N
 - Notify データのタイムアウト検知（一定時間 Notify が来ない場合に「値が古い」ことを判別する仕組み）
 - Write キャラクタリスティック活用 (将来の制御コマンド)
 - データ検証 (CRC / バージョン / シーケンス番号)
-- LED 点灯時間制御 (非同期タイマ) および点滅パターンで状態表示
 - 状態遷移図とエラーハンドリング整備
+- BLE接続タイムアウト（`BLE_GAP_EVT_TIMEOUT`）の未処理: 接続試行が応答なくタイムアウトした場合、`connectCallback`/`disconnectCallback` いずれも呼ばれず該当ペリフェラルが `STATE_DO_CONNECT` のまま復帰できなくなる可能性があり、ハンドリングの追加を検討
 - I2Cスレーブ簡素化（ESP-IDFネイティブAPI依存の撤去、標準Wireへの回帰）が実機でも安定して動作するかの長時間検証、および BLE central 処理（スキャン/接続）との競合有無の確認
 
 ## ライセンス
@@ -240,4 +256,8 @@ Notify callback for characteristic ... of data length N
 本ソフトウェアは MIT License です。`LICENSE` を参照してください。
 
 ---
-ドキュメント最終更新: 2026-08-09 (M5NanoC6 (ESP32-C6) から Seeed Xiao nRF52840 へ移植。I2Cスレーブを ESP-IDF ネイティブドライバから標準 `Wire` ライブラリへ、BLE Central を arduino-esp32 の `BLEDevice` から `Bluefruit52Lib` へ全面書き換え)
+ドキュメント最終更新: 2026-08-09 (M5NanoC6 (ESP32-C6) から Seeed Xiao nRF52840 へ移植。I2Cスレーブを ESP-IDF ネイティブドライバから標準 `Wire` ライブラリへ、BLE Central を arduino-esp32 の `BLEDevice` から `Bluefruit52Lib` へ全面書き換え。
+
+その後の実機デバッグで判明した3件の接続不良の原因を修正: (1) `Scanner.filterUuid()` がアドバタイズ名を含むScan Responseパケットを誤って破棄していた、(2) 接続後の `getPeerName()` によるピア名再判別がATT MTU既定値(23byte)で20byte以上の名前を切り詰めて誤判定していた、(3) 対向機側がPRI/SEC/FUELを1回のnotifyにまとめて送信しATT MTU超過分が切り捨てられていた(`Chibi-T_Furoshiki_AutoAirAdjust`側で個別notifyに分割して解消)。
+
+あわせて、Notify受信時の一時点灯だった青色LEDを接続状態表示（赤=いずれか未接続/青=両方接続完了の排他点灯）に変更。実機検証でオンボードLEDが `variant.h` の想定(active-high)と逆の active-low であることが判明し、`LED_ON`/`LED_OFF` マクロで吸収)
